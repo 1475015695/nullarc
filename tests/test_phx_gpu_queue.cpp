@@ -28,6 +28,18 @@ int main() {
     fenceWords[1] = 0x00000001u;
     assert(phxReadFence64(fenceWords) == 0x00000001ffffffffull);
 
+    // Per-queue retirement helper checks.
+    PhxGpuQueue qr{};
+    assert(phxQueueRetired(qr, 0, 42) == 42); // not ready queue never blocks gSeq
+    qr.ready = true;
+    qr.tail = 2;
+    qr.fseq[0] = 10;
+    qr.fseq[1] = 15;
+    assert(phxQueueRetired(qr, 0, 20) == 9);
+    assert(phxQueueRetired(qr, 10, 20) == 14);
+    assert(phxQueueRetired(qr, 15, 20) == 20);
+    assert(phxQueueRetired(qr, 0, 5) == 5); // already bounded by gSeq < fseq[oldest] - 1
+
     q = {};
     q.tail = 1;
     q.fseq[0] = 1;

@@ -18,6 +18,7 @@ class NativeSubmitTest(unittest.TestCase):
 #include "phxbringup/PhxNativeABI.h"
 #include "phxbringup/PhxGpuQueue.h"
 #include "phxbringup/PhxPendingFences.h"
+#include "phxbringup/PhxVaMaps.h"
 using IOReturn=int;
 constexpr int kIOReturnSuccess=0,kIOReturnNotReady=1,kIOReturnBusy=2,kIOReturnTimeout=3;
 constexpr int kIOReturnBadArgument=4,kIOReturnNotFound=5,kIOReturnUnsupported=6;
@@ -55,8 +56,9 @@ struct PhxBringup {
     uint64_t hwTick=0,gSeq=0,fbMcBase=0x8000000000ull;
     bool fault=false,flushOk=false,stopped=false,sleeping=false;
     Memory ring,doorbell; Memory *fbAper=&ring,*doorbellMap=&doorbell;
-    unsigned packetWrites=0,registerWrites=0;
+    unsigned packetWrites=0,registerWrites=0,hdpFlushes=0;
     PhxBringup(){gq[0].ready=true;gq[0].ringDw=1024;}
+    uint8_t queueIndexFor(bool gfx)const{return gfx ? (gq[1].ready ? 1u : 0u) : (gq[0].ready ? 0u : 1u);}
     bool isStopped()const{return stopped;}
     bool isGpuSleeping()const{return sleeping;}
     bool vmHealthy()const{return !fault;}
@@ -69,7 +71,7 @@ struct PhxBringup {
     void wreg(unsigned,unsigned){registerWrites++;}
     bool vmFlushTlb(unsigned){if(!flushOk)fault=true;return flushOk;}
     void ringPut(GpuQueue &,unsigned,uint32_t){packetWrites++;}
-    void hdpFlush(){}
+    void hdpFlush(){hdpFlushes++;}
     uint32_t vmBind(uint32_t);
     IOReturn gpuSubmit(uint32_t,bool,const uint64_t *,const uint32_t *,uint32_t,uint64_t *);
 };
@@ -82,10 +84,15 @@ struct IOExternalMethodArguments {
 };
 struct IOAccelPhxNativeClient {
     struct Bo { IOMemoryDescriptor *md; uint64_t size=8; uint8_t *kva; } bo;
-    struct Map { bool used=false; uint64_t va=0,size=0,off=0; unsigned handle=0; } maps[1];
+    using Map = PhxVaMap;
+    Map maps[1]{};
+    int mapCount=0;
     PhxBringup *owner;
     bool ctx[PHXN_MAX_CTX+1]{};
     uint64_t emitted=0,lastSeq=0;
+    uint64_t lastSeqByQueue[2]{0, 0};
+    struct SeqQueue { uint64_t seq; uint8_t qi; } seqQueues[64]{};
+    uint32_t seqQueueHead=0;
     unsigned vmid=1;
     PhxPendingFences pendingFences;
     IOAccelPhxNativeClient(){ctx[1]=true;}
@@ -144,8 +151,8 @@ int main() {
     assert(client.doSubmit(&args)==kIOReturnNoMemory && !oom.registerWrites && !allocations);
     failAllocation=false;
     PhxBringup success;success.flushOk=true;gTrackedGpuLock=success.gpuLock;client.owner=&success;
-    assert(client.doSubmit(&args)==0 && success.gSeq==1 && success.packetWrites);
-    assert(client.emitted==1 && client.lastSeq==1 && args.scalarOutput[0]==1);
+    assert(client.doSubmit(&args)==0 && success.gSeq==1 && success.packetWrites && success.hdpFlushes==1);
+    assert(client.emitted==1 && client.lastSeq==1 && client.lastSeqByQueue[0]==1 && args.scalarOutput[0]==1);
     assert(allocations==1 && md.refs==2 && client.pendingFences.head);
     auto *f=client.pendingFences.take(1);f->memory->release();IOFree(f,sizeof(*f));
     assert(!allocations && md.refs==1 && !client.pendingFences.head);

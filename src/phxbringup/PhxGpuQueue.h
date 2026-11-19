@@ -29,6 +29,15 @@ inline bool phxQueueOldest(const PhxGpuQueue &q, uint64_t done, uint32_t &slot) 
     return false;
 }
 
+inline uint64_t phxQueueRetired(const PhxGpuQueue &q, uint64_t done, uint64_t gSeq) {
+    if (!q.ready)
+        return gSeq;
+    uint32_t oldest = 0;
+    if (phxQueueOldest(q, done, oldest) && q.fseq[oldest] - 1 < gSeq)
+        return q.fseq[oldest] - 1;
+    return gSeq;
+}
+
 enum class PhxHangAction { None, Vmid, All };
 
 inline PhxHangAction phxQueueHangAction(PhxGpuQueue &q, uint64_t done, uint64_t now, uint64_t limit,

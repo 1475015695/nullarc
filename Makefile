@@ -12,6 +12,7 @@ TESTS = $(TEST_BIN_DIR)/test_rdna3_discovery_uma \
         $(TEST_BIN_DIR)/test_phx_topology \
         $(TEST_BIN_DIR)/test_wait_seq \
         $(TEST_BIN_DIR)/test_phx_gpu_queue \
+        $(TEST_BIN_DIR)/test_phx_va_maps \
         $(TEST_BIN_DIR)/test_phx_pending_fences \
         $(TEST_BIN_DIR)/test_hdmi_modeset_validation
 
@@ -29,6 +30,9 @@ $(TEST_BIN_DIR)/test_phx_pending_fences: tests/test_phx_pending_fences.cpp src/p
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@
 
 $(TEST_BIN_DIR)/test_phx_gpu_queue: tests/test_phx_gpu_queue.cpp src/phxbringup/PhxGpuQueue.h | $(TEST_BIN_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@
+
+$(TEST_BIN_DIR)/test_phx_va_maps: tests/test_phx_va_maps.cpp src/phxbringup/PhxVaMaps.h | $(TEST_BIN_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@
 
 $(TEST_BIN_DIR)/test_wait_seq: tests/test_wait_seq.cpp | $(TEST_BIN_DIR)
@@ -56,6 +60,7 @@ test: $(TESTS)
 	python3 tests/test_native_sysmem.py
 	python3 tests/test_native_submit.py
 	python3 tests/test_native_p0_safety.py
+	python3 tests/test_native_p1_perf.py
 	python3 tests/test_install_safety.py
 	python3 tests/test_release_pci_matches.py
 	python3 tests/test_ue200watch.py

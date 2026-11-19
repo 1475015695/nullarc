@@ -16,6 +16,7 @@ class NativeVmTest(unittest.TestCase):
 #include <cstdint>
 #include "phxbringup/PhxRange.h"
 #include "phxbringup/PhxNativeABI.h"
+#include "phxbringup/PhxVaMaps.h"
 using IOReturn=int; using IOByteCount=uint64_t; using addr64_t=uint64_t;
 constexpr int kIOReturnSuccess=0, kIOReturnBadArgument=1, kIOReturnNotReady=2;
 constexpr int kIOReturnVMError=3, kIOReturnNoMemory=4, kIOReturnNotFound=5;
@@ -26,7 +27,7 @@ constexpr uint64_t kVaMask=(1ull<<48)-1;
 struct Lock { bool held=false; };
 void IOLockLock(Lock *l) { assert(!l->held); l->held=true; }
 void IOLockUnlock(Lock *l) { assert(l->held); l->held=false; }
-void flushLine(void *) {}
+void flushLine(const volatile void *) {}
 struct IOMemoryDescriptor {
     int failPage=-1, shortPage=-1;
     unsigned reads=0;
@@ -64,9 +65,9 @@ struct IOExternalMethodArguments { void *structureInput; };
 bool shape(IOExternalMethodArguments *, unsigned, unsigned, unsigned, unsigned) { return true; }
 struct IOAccelPhxNativeClient {
     struct Bo { uint64_t size=8192; IOMemoryDescriptor *md; } bo;
-    struct Map {
-        bool used; uint32_t handle; uint64_t va,size,off; uint32_t flags;
-    } maps[1]{};
+    using Map = PhxVaMap;
+    Map maps[1]{};
+    int mapCount=0;
     PhxBringup *owner;
     unsigned vmid=1;
     Bo *findBo(unsigned h) { return h==1 ? &bo : nullptr; }

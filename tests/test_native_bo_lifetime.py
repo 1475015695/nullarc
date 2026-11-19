@@ -24,6 +24,7 @@ class NativeLifetimeTest(unittest.TestCase):
         code = r'''
 #include <cassert>
 #include <cstdint>
+#include "phxbringup/PhxVaMaps.h"
 using IOReturn = int;
 constexpr int kIOReturnBadArgument=1, kIOReturnNotFound=2, kIOReturnBusy=3, kIOReturnSuccess=0;
 constexpr int kMaxMaps=1;
@@ -42,7 +43,9 @@ struct Owner {
 };
 struct IOAccelPhxNativeClient {
     struct Bo { bool host=false; uint32_t domain=2, bits=0; uint64_t size=8; bool live=true; } bo;
-    struct Map { bool used=true; uint32_t handle=1; uint64_t va=4096, size=4096; } maps[1];
+    using Map = PhxVaMap;
+    Map maps[1]{{true, 1, 4096, 4096, 0, 0}};
+    int mapCount=1;
     Owner *owner;
     uint64_t lastSeq=7, hostUsed=8, gttUsed=8, hiUsed=8, visUsed=8;
     uint32_t vmid=1;
@@ -63,11 +66,11 @@ int main() {
     IOAccelPhxNativeClient client; client.owner=&owner;
     IOExternalMethodArguments args{{1}};
     assert(client.doBoFree(&args)==kIOReturnBusy);
-    assert(sleeps==5000 && client.bo.live && client.maps[0].used);
+    assert(sleeps==5000 && client.bo.live && client.mapCount==1);
     assert(!client.releases && !owner.unmaps && client.gttUsed==8 && !client.fences);
     owner.after=sleeps+3;
     assert(client.doBoFree(&args)==kIOReturnSuccess);
-    assert(!client.bo.live && !client.maps[0].used && client.gttUsed==0);
+    assert(!client.bo.live && client.mapCount==0 && client.gttUsed==0);
     assert(client.releases==1 && owner.unmaps==1 && client.fences==1);
     assert(client.doBoFree(&args)==kIOReturnNotFound);
     owner.healthy=false;
@@ -78,14 +81,20 @@ int main() {
     assert(client.waitIdle() && sleeps==before);
     IOAccelPhxNativeClient failed; failed.owner=&owner;
     owner.unmapError=4;
-    assert(failed.doBoFree(&args)==4 && failed.bo.live && failed.maps[0].used);
+    assert(failed.doBoFree(&args)==4 && failed.bo.live && failed.mapCount==1);
     assert(failed.gttUsed==8 && !failed.releases);
+    // Unmapped kernel BO skips waitIdle even when GPU is behind lastSeq.
+    IOAccelPhxNativeClient unmapped; unmapped.owner=&owner; unmapped.mapCount=0;
+    owner.after=~0ull;
+    unsigned sleepsBefore=sleeps;
+    assert(unmapped.doBoFree(&args)==kIOReturnSuccess && sleeps==sleepsBefore && !unmapped.bo.live);
 }
 '''
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp)
             (path / 'test.cpp').write_text(code)
             subprocess.run(['clang++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
+                            '-I' + str(ROOT / 'src'),
                             str(path / 'test.cpp'), '-o', str(path / 'test')], check=True)
             subprocess.run([str(path / 'test')], check=True)
 

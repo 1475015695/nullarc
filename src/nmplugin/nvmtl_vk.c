@@ -133,6 +133,17 @@ static VkPhysicalDeviceLimits g_lim;
 static uint32_t g_sm_count;
 static _Atomic int g_state;
 static _Atomic long g_slow_submit_ms;
+static PFN_vkCreatePipelineCache pvkCreatePipelineCache;
+static PFN_vkDestroyPipelineCache pvkDestroyPipelineCache;
+static PFN_vkGetPipelineCacheData pvkGetPipelineCacheData;
+static VkPipelineCache g_pipe_cache;
+static _Atomic uint64_t g_pipe_compiled;
+static pthread_mutex_t g_pipe_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static char g_pipe_cache_path[PATH_MAX];
+#define NVMTL_FENCE_POOL_CAP 32
+static VkFence g_fence_pool[NVMTL_FENCE_POOL_CAP];
+static unsigned g_fence_pool_n;
+static pthread_mutex_t g_fence_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t g_submit_wait_ns, g_submit_waits;
 void nvmtl_vk_submit_wait_stats(uint64_t *total_ns, uint64_t *waits)
 {
@@ -411,14 +422,146 @@ static VkResult nvmtl_opaque_CreateCommandPool(VkDevice dev, const VkCommandPool
     if (result == VK_SUCCESS) *out = handle;
     return result;
 }
+static void nvmtl_pipe_cache_path(char *out, size_t cap, uint16_t vendor, const char *prog, const char *tmpdir, unsigned uid)
+{
+    if (!out || !cap) return;
+    out[0] = 0;
+    char safe[64];
+    size_t si = 0;
+    const char *p = (prog && *prog) ? prog : "app";
+    for (; *p && si + 1 < sizeof(safe); p++) {
+        unsigned char ch = (unsigned char)*p;
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
+            ch == '.' || ch == '_' || ch == '-')
+            safe[si++] = (char)ch;
+        else
+            safe[si++] = '_';
+    }
+    safe[si] = 0;
+    const char *dir = (tmpdir && *tmpdir) ? tmpdir : "/tmp";
+    size_t dlen = strlen(dir);
+    snprintf(out, cap, "%s%snvmtl-pcache-%u-%04x-%s.bin", dir, (dlen > 0 && dir[dlen - 1] == '/') ? "" : "/", uid, (unsigned)vendor, safe);
+}
+static void nvmtl_pipe_cache_save(void)
+{
+    if (g_state != 1 || !g_pipe_cache || !g_pipe_cache_path[0] || !pvkGetPipelineCacheData) return;
+    pthread_mutex_lock(&g_pipe_cache_lock);
+    VkPipelineCache cache = g_pipe_cache;
+    if (!cache || g_state != 1) { pthread_mutex_unlock(&g_pipe_cache_lock); return; }
+    size_t sz = 0;
+    if (pvkGetPipelineCacheData(g_dev, cache, &sz, NULL) != VK_SUCCESS || !sz || sz > (64u << 20)) {
+        pthread_mutex_unlock(&g_pipe_cache_lock);
+        return;
+    }
+    void *buf = malloc(sz);
+    if (!buf) { pthread_mutex_unlock(&g_pipe_cache_lock); return; }
+    if (pvkGetPipelineCacheData(g_dev, cache, &sz, buf) != VK_SUCCESS || !sz) {
+        free(buf);
+        pthread_mutex_unlock(&g_pipe_cache_lock);
+        return;
+    }
+    char tmp[PATH_MAX];
+    int n = snprintf(tmp, sizeof(tmp), "%s.tmp.%d", g_pipe_cache_path, (int)getpid());
+    if (n > 0 && (size_t)n < sizeof(tmp)) {
+        FILE *f = fopen(tmp, "wb");
+        if (f) {
+            size_t wr = fwrite(buf, 1, sz, f);
+            int closed = fclose(f);
+            if (wr == sz && closed == 0) {
+                if (rename(tmp, g_pipe_cache_path) != 0) unlink(tmp);
+            } else {
+                unlink(tmp);
+            }
+        }
+    }
+    free(buf);
+    pthread_mutex_unlock(&g_pipe_cache_lock);
+}
+static void nvmtl_pipe_cache_init(void)
+{
+    const char *env = getenv("NVMTL_PIPE_CACHE");
+    if (env && env[0] == '0') {
+        nvlog("vk: persistent pipeline cache OFF (NVMTL_PIPE_CACHE=0)");
+        return;
+    }
+    if (!pvkCreatePipelineCache || !pvkDestroyPipelineCache || !pvkGetPipelineCacheData) return;
+    nvmtl_pipe_cache_path(g_pipe_cache_path, sizeof(g_pipe_cache_path), nvmtl_vk_vendor(),
+                          getprogname(), getenv("TMPDIR"), (unsigned)geteuid());
+    void *data = NULL;
+    size_t sz = 0;
+    if (g_pipe_cache_path[0]) {
+        FILE *f = fopen(g_pipe_cache_path, "rb");
+        if (f) {
+            if (fseek(f, 0, SEEK_END) == 0) {
+                long fsz = ftell(f);
+                if (fsz > 0 && (unsigned long)fsz <= (64ul << 20) && fseek(f, 0, SEEK_SET) == 0) {
+                    data = malloc((size_t)fsz);
+                    if (data) {
+                        sz = fread(data, 1, (size_t)fsz, f);
+                        if (sz != (size_t)fsz) { free(data); data = NULL; sz = 0; }
+                    }
+                }
+            }
+            fclose(f);
+        }
+    }
+    VkPipelineCacheCreateInfo ci = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, sz, data };
+    VkPipelineCache pc = VK_NULL_HANDLE;
+    VkResult r = pvkCreatePipelineCache(g_dev, &ci, NULL, &pc);
+    if (r != VK_SUCCESS && data) {
+        free(data); data = NULL; sz = 0;
+        ci.initialDataSize = 0; ci.pInitialData = NULL;
+        r = pvkCreatePipelineCache(g_dev, &ci, NULL, &pc);
+    }
+    if (data) free(data);
+    if (r == VK_SUCCESS && pc) {
+        g_pipe_cache = pc;
+        atexit(nvmtl_pipe_cache_save);
+        nvlog("vk: persistent pipeline cache ON (%zu bytes loaded from %s)", sz, g_pipe_cache_path);
+    }
+}
+static void nvmtl_pipe_cache_note_compile(void)
+{
+    uint64_t n = atomic_fetch_add(&g_pipe_compiled, 1) + 1;
+    if (n >= 8 && (n & (n - 1)) == 0)
+        nvmtl_pipe_cache_save();
+}
+static VkResult nvmtl_fence_acquire(VkFence *out)
+{
+    pthread_mutex_lock(&g_fence_pool_lock);
+    if (g_fence_pool_n > 0) {
+        *out = g_fence_pool[--g_fence_pool_n];
+        pthread_mutex_unlock(&g_fence_pool_lock);
+        return VK_SUCCESS;
+    }
+    pthread_mutex_unlock(&g_fence_pool_lock);
+    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, 0 };
+    return pvkCreateFence(g_dev, &fci, NULL, out);
+}
+static void nvmtl_fence_release(VkFence fence, int healthy)
+{
+    if (!fence) return;
+    if (healthy && g_state == 1 && pvkResetFences && pvkResetFences(g_dev, 1, &fence) == VK_SUCCESS) {
+        pthread_mutex_lock(&g_fence_pool_lock);
+        if (g_fence_pool_n < NVMTL_FENCE_POOL_CAP) {
+            g_fence_pool[g_fence_pool_n++] = fence;
+            pthread_mutex_unlock(&g_fence_pool_lock);
+            return;
+        }
+        pthread_mutex_unlock(&g_fence_pool_lock);
+    }
+    pvkDestroyFence(g_dev, fence, NULL);
+}
+
 static VkResult nvmtl_opaque_CreateGraphicsPipelines(VkDevice dev, VkPipelineCache cache, uint32_t count, const VkGraphicsPipelineCreateInfo *info, const VkAllocationCallbacks *allocator, void **out)
 {
     if (count != 1) return VK_ERROR_INITIALIZATION_FAILED;
+    if (cache == VK_NULL_HANDLE) cache = g_pipe_cache;
     VkPipeline handle = VK_NULL_HANDLE;
     VkGraphicsPipelineCreateInfo pinfo;
     if (g_pstat) { pinfo = *info; pinfo.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR; info = &pinfo; }
     VkResult result = pvkCreateGraphicsPipelines(dev, cache, count, info, allocator, &handle);
-    if (result == VK_SUCCESS) *out = handle;
+    if (result == VK_SUCCESS) { *out = handle; nvmtl_pipe_cache_note_compile(); }
     else if (handle) pvkDestroyPipeline(dev, handle, allocator);
     return result;
 }
@@ -454,9 +597,10 @@ int nvmtl_vk_pipeline_stats(void *pipe, char *out, size_t n)
 static VkResult nvmtl_opaque_CreateComputePipelines(VkDevice dev, VkPipelineCache cache, uint32_t count, const VkComputePipelineCreateInfo *info, const VkAllocationCallbacks *allocator, void **out)
 {
     if (count != 1) return VK_ERROR_INITIALIZATION_FAILED;
+    if (cache == VK_NULL_HANDLE) cache = g_pipe_cache;
     VkPipeline handle = VK_NULL_HANDLE;
     VkResult result = pvkCreateComputePipelines(dev, cache, count, info, allocator, &handle);
-    if (result == VK_SUCCESS) *out = handle;
+    if (result == VK_SUCCESS) { *out = handle; nvmtl_pipe_cache_note_compile(); }
     else if (handle) pvkDestroyPipeline(dev, handle, allocator);
     return result;
 }
@@ -1081,6 +1225,9 @@ static int nvmtl_vk_initialize(void)
     pvkCreateRenderPass2 = (PFN_vkCreateRenderPass2)pvkGetDeviceProcAddr(g_dev, "vkCreateRenderPass2");
     pvkCreateBufferView = (PFN_vkCreateBufferView)pvkGetDeviceProcAddr(g_dev, "vkCreateBufferView");
     pvkDestroyBufferView = (PFN_vkDestroyBufferView)pvkGetDeviceProcAddr(g_dev, "vkDestroyBufferView");
+    pvkCreatePipelineCache = (PFN_vkCreatePipelineCache)pvkGetDeviceProcAddr(g_dev, "vkCreatePipelineCache");
+    pvkDestroyPipelineCache = (PFN_vkDestroyPipelineCache)pvkGetDeviceProcAddr(g_dev, "vkDestroyPipelineCache");
+    pvkGetPipelineCacheData = (PFN_vkGetPipelineCacheData)pvkGetDeviceProcAddr(g_dev, "vkGetPipelineCacheData");
     { VkPhysicalDeviceDepthStencilResolveProperties dsp = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES };
       VkPhysicalDeviceProperties2 pp2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &dsp };
       pvkGetPhysicalDeviceProperties2(g_pdev, &pp2);
@@ -1092,6 +1239,7 @@ static int nvmtl_vk_initialize(void)
     pvkGetDeviceQueue(g_dev, g_qfam, 0, &g_queue);
 
     g_state = 1;
+    nvmtl_pipe_cache_init();
     nvlog("vk: UP in this Metal process — \"%s\" api %u.%u.%u, queue family %u", g_name,
           VK_VERSION_MAJOR(pp.apiVersion), VK_VERSION_MINOR(pp.apiVersion), VK_VERSION_PATCH(pp.apiVersion), g_qfam);
     return 0;
@@ -1469,7 +1617,7 @@ int nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out)
     if (pvkBindBufferMemory(g_dev, (VkBuffer)out->buf, (VkDeviceMemory)out->mem, 0) != VK_SUCCESS) {
         nvlog("vk: vkBindBufferMemory refused the imported allocation");
         pvkFreeMemory(g_dev, (VkDeviceMemory)out->mem, NULL); pvkDestroyBuffer(g_dev, (VkBuffer)out->buf, NULL);
-        out->buf = NULL; out->mem = NULL; return -1; }
+        out->buf = NULL; out->mem = NULL; out->bda = 0; return -1; }
     out->map = ptr; out->alloc = size; out->imported = 1; out->htype = mt + 1;
     g_alloc_bytes += size; g_buf_made++;
     { static int said; if (!said++) nvlog("vk: imported the caller's pages as device memory — %zu bytes at %p, memory type %d", size, ptr, mt); }
@@ -3602,7 +3750,11 @@ static int nvmtl_rp_light(void)
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("NVMTL_RP_LIGHT");
-        on = e && e[0] == '1' && getprogname() && !strcmp(getprogname(), "WindowServer");
+        const int is_ws = getprogname() && !strcmp(getprogname(), "WindowServer");
+        if (!is_ws) on = 0;
+        else if (e && e[0] == '0') on = 0;
+        else if (e && e[0] == '1') on = 1;
+        else on = (nvmtl_vk_vendor() == 0x1002) ? 1 : 0;
         if (on) nvlog("render passes: entry dependency only (NVMTL_RP_LIGHT=1)");
     }
     return on;
@@ -4250,7 +4402,7 @@ static int nvmtl_vk_pipeline_create_impl_lifetime_body(const void *vs, size_t vn
         VK_TRUE, VK_TRUE, VK_COMPARE_OP_LESS, VK_FALSE, VK_FALSE, { 0 }, { 0 }, 0.0f, 1.0f };
     VkGraphicsPipelineCreateInfo gp = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, nstages, stages,
         &vi, &ia, td ? &tss : NULL, &vps, &rs, &ms, hasDepth ? &ds : NULL, &cb, &dsci, out->layout, out->rp, 0, VK_NULL_HANDLE, -1 };
-    NVMTL_PIPELINE_STAGE(nvmtl_opaque_CreateGraphicsPipelines(g_dev, VK_NULL_HANDLE, 1, &gp, NULL, &out->pipe), "vkCreateGraphicsPipelines");
+    NVMTL_PIPELINE_STAGE(nvmtl_opaque_CreateGraphicsPipelines(g_dev, g_pipe_cache, 1, &gp, NULL, &out->pipe), "vkCreateGraphicsPipelines");
     if (tcm) pvkDestroyShaderModule(g_dev, tcm, NULL);
     if (tvm) pvkDestroyShaderModule(g_dev, tvm, NULL);
     pvkDestroyShaderModule(g_dev, fmod, NULL);
@@ -4364,7 +4516,7 @@ static int nvmtl_vk_compute_pipeline_create_g_lifetime_body(const void *cs, size
     VkComputePipelineCreateInfo cpi = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0,
         { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, mod, "main", NULL },
         out->layout, VK_NULL_HANDLE, -1 };
-    VKCK(nvmtl_opaque_CreateComputePipelines(g_dev, VK_NULL_HANDLE, 1, &cpi, NULL, &out->pipe), "vkCreateComputePipelines");
+    VKCK(nvmtl_opaque_CreateComputePipelines(g_dev, g_pipe_cache, 1, &cpi, NULL, &out->pipe), "vkCreateComputePipelines");
     out->mod = mod;
     return 0;
 }
@@ -4436,12 +4588,13 @@ static VkPipeline nvmtl_compute_variant(nvk_pipeline *p, const uint32_t l[3])
         VkComputePipelineCreateInfo cpi = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0,
             { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, (VkShaderModule)p->mod, "main", &si },
             (VkPipelineLayout)p->layout, VK_NULL_HANDLE, -1 };
-        VkResult r = pvkCreateComputePipelines(g_dev, VK_NULL_HANDLE, 1, &cpi, NULL, &found);
+        VkResult r = pvkCreateComputePipelines(g_dev, g_pipe_cache, 1, &cpi, NULL, &found);
         if (r != VK_SUCCESS) {
             if (found) pvkDestroyPipeline(g_dev, found, NULL);
             nvlog("vk: compute variant %ux%ux%u -> %d — this dispatch is SKIPPED", l[0], l[1], l[2], r); found = VK_NULL_HANDLE;
         }
         else {
+            nvmtl_pipe_cache_note_compile();
             if (p->nvar == p->capvar && p->capvar < NVMTL_NVAR_MAX) {
                 uint32_t cap = p->capvar ? p->capvar * 2 : NVMTL_NVAR;
                 struct nvmtl_cvar *g = realloc(p->var, cap * sizeof *g);
@@ -5814,8 +5967,8 @@ int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
     VkResult result = pvkEndCommandBuffer(c->cb);
     const uint64_t sB = nvmtl_perf_now();
     if (result != VK_SUCCESS) { nvmtl_cmd_retire(c); return -1; }
-    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO }; VkFence fence;
-    result = pvkCreateFence(g_dev, &fci, NULL, &fence);
+    VkFence fence = VK_NULL_HANDLE;
+    result = nvmtl_fence_acquire(&fence);
     const uint64_t sC = nvmtl_perf_now();
     if (result != VK_SUCCESS) { nvmtl_cmd_retire(c); return -1; }
     nvmtl_prologue *const pre = &f->pre;
@@ -5852,6 +6005,7 @@ int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
     pt[4] = nvmtl_perf_now();
     g_cmd_submitted++;
     if (result != VK_SUCCESS) {
+        nvmtl_fence_release(fence, 0);
         g_state = -1;
         nvlog("vk: queue submit -> %d; disabling backend and retaining uncertain in-flight resources", result);
         return -2;
@@ -5937,7 +6091,7 @@ int nvmtl_vk_submit_finish(nvmtl_inflight *f)
         }
         pvkDestroyQueryPool(g_dev, (VkQueryPool)c->pt_pool, NULL); c->pt_pool = NULL; c->pt_n = 0;
     }
-    pvkDestroyFence(g_dev, fence, NULL);
+    nvmtl_fence_release(fence, 1);
     if (c->nsets > g_peak_sets) { g_peak_sets = c->nsets; nvlog("vk: commit high-water: %u descriptor sets = %u draws in one command buffer (%u pools open)", c->nsets, c->nsets / 2, g_ndescPools); }
     if (c->nfb > g_peak_fbs) g_peak_fbs = c->nfb;
     if (c->skipped) nvlog("vk: commit with %u draws/dispatches SKIPPED (no descriptor set could be allocated)", c->skipped);
@@ -6669,6 +6823,20 @@ void nvmtl_vk_cmd_barrier_c2c(nvk_cmdbuf *c)
     pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                           0, 1, &mb, 0, NULL, 0, NULL);
 }
+static void nvmtl_vk_cmd_barrier_to_transfer(nvk_cmdbuf *c)
+{
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL,
+        VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT };
+    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          0, 1, &mb, 0, NULL, 0, NULL);
+}
+static void nvmtl_vk_cmd_barrier_from_transfer(nvk_cmdbuf *c)
+{
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
+    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                          0, 1, &mb, 0, NULL, 0, NULL);
+}
 
 int nvmtl_vk_rt_available(void) { return nvmtl_vk_init() ? 0 : g_rt; }
 
@@ -6971,7 +7139,8 @@ static int nvmtl_visibility_sum_init(void)
         VkComputePipelineCreateInfo pi = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0,
                                           stage, layout, VK_NULL_HANDLE, -1 };
         VkPipeline pipeline = VK_NULL_HANDLE;
-        if (pvkCreateComputePipelines(g_dev, VK_NULL_HANDLE, 1, &pi, NULL, &pipeline) == VK_SUCCESS) {
+        if (pvkCreateComputePipelines(g_dev, g_pipe_cache, 1, &pi, NULL, &pipeline) == VK_SUCCESS) {
+            nvmtl_pipe_cache_note_compile();
             g_visibility_sum_layout = layout; g_visibility_sum_pipeline = pipeline; rc = 0;
         } else {
             if (pipeline) pvkDestroyPipeline(g_dev, pipeline, NULL);
@@ -7260,27 +7429,31 @@ int nvmtl_vk_gpu_timestamp(uint64_t *cpu_ns, uint64_t *gpu)
 uint64_t nvmtl_vk_buffer_address(nvk_buffer *b)
 {
     if (!b || !b->buf || !pvkGetBufferDeviceAddress) return 0;
+    uint64_t cached = __atomic_load_n(&b->bda, __ATOMIC_RELAXED);
+    if (cached) return cached;
     VkBufferDeviceAddressInfo i = { VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, NULL, (VkBuffer)b->buf };
-    return pvkGetBufferDeviceAddress(g_dev, &i);
+    uint64_t addr = pvkGetBufferDeviceAddress(g_dev, &i);
+    if (addr) __atomic_store_n(&b->bda, addr, __ATOMIC_RELAXED);
+    return addr;
 }
 
 int nvmtl_vk_cmd_fill_buffer(nvk_cmdbuf *c, nvk_buffer *b, size_t offset, size_t size, uint8_t value)
 {
     if (!size) return 0;
     if ((offset | size) & 3 || offset > b->size || size > b->size - offset) return -1;
-    nvmtl_vk_cmd_barrier(c);
+    nvmtl_vk_cmd_barrier_to_transfer(c);
     uint32_t word = value; word |= word << 8; word |= word << 16;
     pvkCmdFillBuffer(c->cb, (VkBuffer)b->buf, offset, size, word);
-    nvmtl_vk_cmd_barrier(c);
+    nvmtl_vk_cmd_barrier_from_transfer(c);
     return 0;
 }
 
 int nvmtl_vk_cmd_write_word(nvk_cmdbuf *c, nvk_buffer *b, size_t offset, uint32_t word)
 {
     if ((offset & 3) || offset > b->size || b->size - offset < 4) return -1;
-    nvmtl_vk_cmd_barrier(c);
+    nvmtl_vk_cmd_barrier_to_transfer(c);
     pvkCmdFillBuffer(c->cb, (VkBuffer)b->buf, offset, 4, word);
-    nvmtl_vk_cmd_barrier(c);
+    nvmtl_vk_cmd_barrier_from_transfer(c);
     return 0;
 }
 
@@ -7288,10 +7461,10 @@ int nvmtl_vk_cmd_copy_buffer(nvk_cmdbuf *c, nvk_buffer *src, size_t srcOff, nvk_
 {
     if (!size) return 0;
     if (srcOff > src->size || size > src->size-srcOff || dstOff > dst->size || size > dst->size-dstOff) return -1;
-    nvmtl_vk_cmd_barrier(c);
+    nvmtl_vk_cmd_barrier_to_transfer(c);
     VkBufferCopy bc = { srcOff, dstOff, size };
     pvkCmdCopyBuffer(c->cb, (VkBuffer)src->buf, (VkBuffer)dst->buf, 1, &bc);
-    nvmtl_vk_cmd_barrier(c);
+    nvmtl_vk_cmd_barrier_from_transfer(c);
     return 0;
 }
 
@@ -7319,7 +7492,7 @@ int nvmtl_vk_cmd_copy_buffer_to_image_level_layer(nvk_cmdbuf *c, nvk_buffer *b, 
     if (layer >= (img->layers ? img->layers : 1) || !w || !h || x > lw || w > lw-x || y > lh || h > lh-y
         || row_bytes < tight || row_bytes % bpp || off > b->size || (uint64_t)(rows-1)*row_bytes+tight > b->size-off) return -1;
     if (!w || !h || x + w > lw || y + h > lh) { nvlog("copy_buffer_to_image: out of bounds (level %u is %ux%u)", level, lw, lh); return -1; }
-    nvmtl_vk_cmd_barrier(c);
+    nvmtl_vk_cmd_barrier_to_transfer(c);
     img_to(c, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     VkBufferImageCopy bic = { off, row_bytes / bpp * bw, 0, { nvmtl_copy_aspect(img), level, img->mtl_type == 7 ? 0u : layer, 1 },
@@ -7327,7 +7500,7 @@ int nvmtl_vk_cmd_copy_buffer_to_image_level_layer(nvk_cmdbuf *c, nvk_buffer *b, 
     pvkCmdCopyBufferToImage(c->cb, (VkBuffer)b->buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
     img_to(c, img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-    nvmtl_vk_cmd_barrier(c);
+    nvmtl_vk_cmd_barrier_from_transfer(c);
     return 0;
 }
 
@@ -7348,13 +7521,13 @@ int nvmtl_vk_cmd_copy_image_to_buffer_level_layer(nvk_cmdbuf *c, nvk_image *img,
     if (layer >= (img->layers ? img->layers : 1) || !w || !h || x > lw || w > lw-x || y > lh || h > lh-y
         || row_bytes < tight || row_bytes % bpp || off > b->size || (uint64_t)(rows-1)*row_bytes+tight > b->size-off) return -1;
     if (!w || !h || x + w > lw || y + h > lh) { nvlog("copy_image_to_buffer: out of bounds (level %u is %ux%u)", level, lw, lh); return -1; }
-    nvmtl_vk_cmd_barrier(c);
+    nvmtl_vk_cmd_barrier_to_transfer(c);
     img_to(c, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     VkBufferImageCopy bic = { off, row_bytes / bpp * bw, 0, { nvmtl_copy_aspect(img), level, img->mtl_type == 7 ? 0u : layer, 1 },
                               { (int32_t)x, (int32_t)y, img->mtl_type == 7 ? (int32_t)layer : 0 }, { w, h, 1 } };
     pvkCmdCopyImageToBuffer(c->cb, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, (VkBuffer)b->buf, 1, &bic);
-    nvmtl_vk_cmd_barrier(c);
+    nvmtl_vk_cmd_barrier_from_transfer(c);
     return 0;
 }
 
