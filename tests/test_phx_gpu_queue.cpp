@@ -20,6 +20,14 @@ int main() {
     q.tail = 1;
     assert(!phxQueueOldest(q, 100, slot));
 
+    // Torn-free 64-bit fence helper checks.
+    assert(phxReadFence64(nullptr) == 0);
+    volatile uint32_t fenceWords[2]{0x12345678u, 0x9abcdef0u};
+    assert(phxReadFence64(fenceWords) == 0x9abcdef012345678ull);
+    fenceWords[0] = 0xffffffffu;
+    fenceWords[1] = 0x00000001u;
+    assert(phxReadFence64(fenceWords) == 0x00000001ffffffffull);
+
     q = {};
     q.tail = 1;
     q.fseq[0] = 1;

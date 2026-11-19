@@ -236,10 +236,14 @@ private:
 
     static void vblFire(thread_call_param_t p0, thread_call_param_t) {
         PhxAMDFB *me = (PhxAMDFB *)p0;
-        if (me->fStopping || me->fBlDark) return;
+        if (!me || __atomic_load_n(&me->fStopping, __ATOMIC_ACQUIRE) || me->fBlDark || !me->fVblTimer) return;
         const uint64_t at = mach_absolute_time(), due = me->fVblNext;
         uint64_t near; nanoseconds_to_absolutetime(50000, &near);
-        if (gVblStaged && due > at + near) { thread_call_enter_delayed(me->fVblTimer, due); return; }   // an early stage
+        if (gVblStaged && due > at + near) {
+            if (!__atomic_load_n(&me->fStopping, __ATOMIC_ACQUIRE) && !me->fBlDark && me->fVblTimer)
+                thread_call_enter_delayed(me->fVblTimer, due);
+            return;
+        }   // an early stage
         if (due && at > due) {
             uint64_t ns; absolutetime_to_nanoseconds(at - due, &ns);
             const SInt64 us = (SInt64)(ns / 1000);
@@ -257,7 +261,8 @@ private:
         const uint64_t now = mach_absolute_time();
         me->fVblNext = (me->fVblNext && me->fVblNext + period > now) ? me->fVblNext + period : now + period;
         uint64_t lead; nanoseconds_to_absolutetime(1500000, &lead);
-        thread_call_enter_delayed(me->fVblTimer, gVblStaged ? me->fVblNext - lead : me->fVblNext);
+        if (!__atomic_load_n(&me->fStopping, __ATOMIC_ACQUIRE) && !me->fBlDark && me->fVblTimer)
+            thread_call_enter_delayed(me->fVblTimer, gVblStaged ? me->fVblNext - lead : me->fVblNext);
     }
 
     // The firmware lit the panel at its native refresh, which the VBL timer and the mode must report: they said 60 Hz while
@@ -343,7 +348,7 @@ public:
             fBlDark = false;
             fVblNext = 0;
             backlightWrite(fBlSaved ? fBlSaved : kBlMax);
-            if (fVblTimer) {
+            if (fVblTimer && !__atomic_load_n(&fStopping, __ATOMIC_ACQUIRE)) {
                 uint64_t d; clock_interval_to_deadline((uint32_t)(fFrameNs / 1000), kMicrosecondScale, &d);
                 fVblNext = d;
                 thread_call_enter_delayed(fVblTimer, d);
@@ -1181,7 +1186,8 @@ bool PhxAMDFB::start(IOService *provider)
 
 void PhxAMDFB::stop(IOService *provider)
 {
-    fStopping = true;
+    __atomic_store_n(&fStopping, true, __ATOMIC_RELEASE);
+    if (fVblTimer) { thread_call_cancel(fVblTimer); while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); } fVblTimer = nullptr; }
     if (gPhxPrimaryFB == this) gPhxPrimaryFB = nullptr;
     if (gPhxHDMI) {
         gPhxHDMI->terminate();
@@ -1194,7 +1200,6 @@ void PhxAMDFB::stop(IOService *provider)
     OSSafeReleaseNULL(fAliasMap);
     OSSafeReleaseNULL(fVa);
     poolFree();
-    if (fVblTimer) { thread_call_cancel(fVblTimer); while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); } fVblTimer = nullptr; }
     gPhxFrameAbs = 0;
     OSSafeReleaseNULL(fMmio);
     OSSafeReleaseNULL(fSurfMap);

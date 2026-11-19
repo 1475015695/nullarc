@@ -105,6 +105,9 @@ struct PhxBringup {
     IOAccelPhxNativeClient *retiringClients=nullptr;
     uint64_t retired=0;
     unsigned contexts=0, sessions=0;
+    bool stopped=false, sleeping=false;
+    bool isStopped() const { return stopped; }
+    bool isGpuSleeping() const { return sleeping; }
     uint64_t gpuRetiredLocked() { assert(gpuLock->held); return retired; }
     bool vmidFree(uint32_t, uint64_t seq) {
         assert(!gpuLock->held);
@@ -149,6 +152,10 @@ int main() {
     owner.reapClients();
     assert(!a.frees && !b.frees);
     owner.retired=7;
+    owner.sleeping=true;
+    owner.reapClients();
+    assert(a.references==2 && !a.frees && owner.contexts==0);
+    owner.sleeping=false;
     owner.reapClients();
     assert(a.references==1 && a.frees==1 && !a.vmid);
     assert(b.references==2 && !b.frees && b.vmid==1);
@@ -184,15 +191,16 @@ void IOLockLock(Lock *l) { assert(!l->held); l->held=true; }
 void IOLockUnlock(Lock *l) { assert(l->held); l->held=false; }
 unsigned flushed;
 void flushLine(void *) { flushed++; }
-constexpr uint32_t kPtChunks=1, kPtChunkPages=1, kFirstUserVmid=8;
-struct Buffer { uint8_t bytes[4096]; void *getBytesNoCopy() { return bytes; } };
+constexpr uint32_t kPtMaxPages=1, kPtPageBytes=4096, kFirstUserVmid=8;
+struct Buffer { uint8_t bytes[4096]; uint64_t *kva() { return reinterpret_cast<uint64_t *>(bytes); } };
 struct PhxBringup {
-    struct VmCtx { Buffer *chunk[1]; uint32_t used=1, hw=8; bool busy=true; } vm[1];
+    struct VmCtx { uint64_t *chunkKva[1]{}; uint32_t used=1, hw=8; bool busy=true; } vm[1];
     struct Hw { uint32_t ctx=1; } hwv[1];
     Lock mutex; Lock *gpuLock=&mutex;
     uint64_t retired=0;
-    bool stopped=false;
+    bool stopped=false, sleeping=false;
     bool isStopped() const { return stopped; }
+    bool isGpuSleeping() const { return sleeping; }
     bool vmHealthy() const { return true; }
     unsigned tlb=0;
     uint64_t gpuRetiredLocked() const { assert(gpuLock->held); return retired; }
@@ -205,7 +213,7 @@ struct PhxBringup {
         code += r'''
 int main() {
     Buffer buffer; std::memset(buffer.bytes, 0xab, sizeof(buffer.bytes));
-    PhxBringup owner; owner.vm[0].chunk[0]=&buffer;
+    PhxBringup owner; owner.vm[0].chunkKva[0]=buffer.kva();
     assert(!owner.vmidFree(1, 7));
     assert(owner.vm[0].busy && owner.vm[0].hw==8 && owner.hwv[0].ctx==1);
     assert(buffer.bytes[0]==0xab && !owner.tlb && !flushed);
@@ -213,6 +221,9 @@ int main() {
     owner.stopped=true;
     assert(!owner.vmidFree(1, 7) && owner.vm[0].busy);
     owner.stopped=false;
+    owner.sleeping=true;
+    assert(!owner.vmidFree(1, 7) && owner.vm[0].busy && !owner.tlb && !owner.gpuLock->held);
+    owner.sleeping=false;
     assert(owner.vmidFree(1, 7));
     assert(!owner.vm[0].busy && !owner.vm[0].hw && !owner.hwv[0].ctx);
     assert(!buffer.bytes[0] && !buffer.bytes[4095] && owner.tlb==1 && flushed==64);

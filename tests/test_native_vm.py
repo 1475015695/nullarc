@@ -48,7 +48,12 @@ struct PhxBringup {
         unsigned index=(va-0x10000)/4096; assert(index<2);
         return allocate && index==static_cast<unsigned>(failPte) ? nullptr : ptes+index;
     }
-    bool flushOk=true, healthy=true;
+    bool flushOk=true, healthy=true, stopped=false, sleeping=false;
+    static constexpr uint32_t kPtReserveCap=516;
+    unsigned refills=0; uint32_t lastRefill=0;
+    bool isStopped() const { return stopped; }
+    bool isGpuSleeping() const { return sleeping; }
+    void ptRefillReserve(uint32_t target) { assert(!gpuLock->held); refills++; lastRefill=target; }
     bool vmHealthy() const { return healthy; }
     bool vmFlushTlb(unsigned) { assert(gpuLock->held); tlbs++; return flushOk; }
     bool gpuReady() { return true; }
@@ -121,6 +126,13 @@ int main() {
     owner.healthy=false;
     reads=md.reads;
     assert(owner.vmMap(1,0x10000,&md,0,8192)==kIOReturnNotReady && md.reads==reads);
+    owner.healthy=true; owner.sleeping=true;
+    assert(owner.vmMap(1,0x10000,&md,0,8192)==kIOReturnNotReady && md.reads==reads && !owner.gpuLock->held);
+    assert(owner.vmUnmap(1,0x10000,8192)==kIOReturnNotReady && !owner.gpuLock->held);
+    owner.sleeping=false;
+    unsigned beforeRefills=owner.refills;
+    owner.flushOk=true;
+    assert(owner.vmMap(1,0x10000,&md,0,8192)==0 && owner.refills==beforeRefills+1 && owner.lastRefill>=3);
 }
 '''
         with tempfile.TemporaryDirectory() as tmp:

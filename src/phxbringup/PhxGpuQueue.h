@@ -43,6 +43,19 @@ inline PhxHangAction phxQueueHangAction(PhxGpuQueue &q, uint64_t done, uint64_t 
     return !q.killedAll && now - q.lastProgress >= limit / 2 ? PhxHangAction::All : PhxHangAction::None;
 }
 
+inline uint64_t phxReadFence64(const volatile uint32_t *f) {
+    if (!f)
+        return 0;
+    for (int attempt = 0; attempt < 1024; attempt++) {
+        const uint32_t hi1 = f[1];
+        const uint32_t lo = f[0];
+        const uint32_t hi2 = f[1];
+        if (hi1 == hi2)
+            return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi1) << 32);
+    }
+    return static_cast<uint64_t>(f[0]) | (static_cast<uint64_t>(f[1]) << 32);
+}
+
 inline bool phxQueueKillValid(const PhxGpuQueue &q, uint32_t slot, uint64_t done,
                              uint32_t owner, uint64_t binding) {
     return q.fseq[slot] > done && owner != 0 && q.fbinding[slot] == binding;

@@ -27,9 +27,18 @@ constexpr int kMaxMaps=1;
 constexpr unsigned kRegCtx0BaseLo=1,kRegCtx0Cntl=100,kRegCtx0StartLo=200,kRegCtx0EndLo=300;
 constexpr uint64_t kVaMask=(1ull<<48)-1;
 struct Lock { bool held=false; };
+Lock *gTrackedGpuLock=nullptr;
+unsigned gDelays=0, gSleeps=0, gWakeOnWait=0;
+bool *gSleepFlag=nullptr;
 void IOLockLock(Lock *l) { assert(!l->held); l->held=true; }
 void IOLockUnlock(Lock *l) { assert(l->held); l->held=false; }
-void IODelay(unsigned) {}
+void onWait() {
+    if (gTrackedGpuLock) assert(!gTrackedGpuLock->held);
+    if (gWakeOnWait && (gDelays + gSleeps) >= gWakeOnWait && gSleepFlag)
+        *gSleepFlag = true;
+}
+void IODelay(unsigned) { gDelays++; onWait(); }
+void IOSleep(unsigned) { gSleeps++; onWait(); }
 void bcopy(const void *s,void *d,size_t n) { std::memmove(d,s,n); }
 template<class... T> void IOLog(const char *,T...) {}
 unsigned allocations=0; bool failAllocation=false;
@@ -44,10 +53,12 @@ struct PhxBringup {
     GpuQueue gq[2]{};
     Lock mutex; Lock *gpuLock=&mutex;
     uint64_t hwTick=0,gSeq=0,fbMcBase=0x8000000000ull;
-    bool fault=false,flushOk=false;
+    bool fault=false,flushOk=false,stopped=false,sleeping=false;
     Memory ring,doorbell; Memory *fbAper=&ring,*doorbellMap=&doorbell;
     unsigned packetWrites=0,registerWrites=0;
     PhxBringup(){gq[0].ready=true;gq[0].ringDw=1024;}
+    bool isStopped()const{return stopped;}
+    bool isGpuSleeping()const{return sleeping;}
     bool vmHealthy()const{return !fault;}
     bool gpuReady()const{return true;}
     bool debugEnabled()const{return false;}
@@ -103,15 +114,33 @@ int main() {
     assert(client.doSubmit(&args)==kIOReturnTimeout);
     assert(owner.fault && !owner.gSeq && !owner.gq[0].tail && !owner.packetWrites);
     assert(!owner.doorbell.words[0] && !owner.gpuLock->held && owner.registerWrites);
+    assert(!owner.hwv[0].ctx && !owner.vm[0].hw); // TLB failure must roll back VMID ownership
     assert(!allocations && md.refs==1 && !client.pendingFences.head);
     assert(!client.emitted && !client.lastSeq && args.scalarOutput[0]==999);
     assert(client.doSubmit(&args)==kIOReturnNotReady && !allocations);
     PhxBringup busy;
+    gTrackedGpuLock=busy.gpuLock; gDelays=0; gSleeps=0;
     for(auto &h:busy.hwv){h.ctx=1;h.lastSeq=100;}
     client.owner=&busy;
     assert(client.doSubmit(&args)==kIOReturnBusy && !busy.fault && !allocations);
+    assert(gDelays==16 && gSleeps==2000 && !busy.gpuLock->held);
     assert(!busy.packetWrites && !busy.gSeq);
-    PhxBringup oom;client.owner=&oom;failAllocation=true;
+    PhxBringup ringBusy; ringBusy.flushOk=true; gTrackedGpuLock=ringBusy.gpuLock;
+    ringBusy.gq[0].head=0; ringBusy.gq[0].tail=63;
+    for(unsigned i=0;i<64;i++) ringBusy.gq[0].fseq[i]=100+i;
+    gDelays=0; gSleeps=0;
+    client.owner=&ringBusy;
+    assert(client.doSubmit(&args)==kIOReturnBusy && !ringBusy.gpuLock->held && gDelays==16 && gSleeps==2000);
+    PhxBringup sleepy; sleepy.flushOk=true; gTrackedGpuLock=sleepy.gpuLock;
+    for(auto &h:sleepy.hwv){h.ctx=1;h.lastSeq=100;}
+    gDelays=0; gSleeps=0; gWakeOnWait=3; gSleepFlag=&sleepy.sleeping;
+    client.owner=&sleepy;
+    assert(client.doSubmit(&args)==kIOReturnNotReady && !sleepy.gpuLock->held && gDelays==3 && !sleepy.gSeq);
+    gWakeOnWait=0; gSleepFlag=nullptr; sleepy.sleeping=false;
+    for(auto &h:sleepy.hwv){h=PhxBringup::HwVmid{};}
+    sleepy.sleeping=true;
+    assert(client.doSubmit(&args)==kIOReturnNotReady && !sleepy.gpuLock->held && !sleepy.packetWrites);
+    PhxBringup oom;client.owner=&oom;failAllocation=true;gTrackedGpuLock=oom.gpuLock;
     assert(client.doSubmit(&args)==kIOReturnNoMemory && !oom.registerWrites && !allocations);
     failAllocation=false;
     PhxBringup success;success.flushOk=true;client.owner=&success;

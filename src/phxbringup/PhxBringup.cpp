@@ -116,6 +116,8 @@ public:
     // user BOs are then mapped into the VMID 8 page table and SUBMIT writes INDIRECT_BUFFERs into the queue's ring.
     IOReturn adoptQueue(const uint64_t in[6]);
     IOReturn claimAccel();
+    IOService *retainAccel(const OSSymbol **symOut);
+    bool isGpuSleeping() const { return __atomic_load_n(&isSleeping, __ATOMIC_ACQUIRE); }
     bool vmHealthy() const { return !__atomic_load_n(&vmFaulted, __ATOMIC_ACQUIRE); }
     bool gpuReady() const { return gq[0].ready || gq[1].ready; }
     // one GPUVM context (VMID 8..15) per client process: RADV instances allocate VAs independently
@@ -178,16 +180,28 @@ private:
     uint64_t queueFence(const GpuQueue &q) const;
     uint64_t gpuRetiredLocked() const;          // caller holds gpuLock (including vmBind)
     IOLock *gpuLock{nullptr};
+    IOLock *accelLock{nullptr};
+    IOService *cachedAccel{nullptr};
+    const OSSymbol *surfVramSym{nullptr};
     // One GPUVM context (page tables) per client, and the eight hardware VMIDs lent to contexts at submission time,
     // as amdgpu does: a fixed VMID per client capped Metal at eight processes, and with every app allowed Metal the
     // ninth got no device (2026-10-20). A context's handle is its index + 1.
-    // A context's page tables, in physically contiguous 64 KiB chunks allocated as it maps (most contexts need one or
-    // two): a single 4 MiB contiguous pool per context failed once memory was fragmented. Table i is page i % 16 of
-    // chunk i / 16; table 0 is the root.
-    static constexpr uint32_t kPtChunkBytes = 64u << 10, kPtChunkPages = kPtChunkBytes / 4096, kPtChunks = 64;
+    // Page tables are individual 4 KiB physically contiguous pages allocated from a pre-filled reserve so neither
+    // fragmentation nor sleeping allocations under gpuLock can wedge submissions. Table lookups use an O(1) hash map.
+    static constexpr uint32_t kPtPageBytes = 4096, kPtMaxPages = 1024, kPtHashCap = 2048, kPtReserveCap = 516;
+    struct PtPage {
+        IOBufferMemoryDescriptor *md;
+        uint64_t phys;
+        uint64_t *kva;
+    };
+    PtPage ptReserve[kPtReserveCap]{};
+    uint32_t ptReserveCount{0};
     struct VmCtx {
-        IOBufferMemoryDescriptor *chunk[kPtChunks];
-        uint64_t chunkPhys[kPtChunks];
+        IOBufferMemoryDescriptor **chunk;
+        uint64_t *chunkPhys;
+        uint64_t **chunkKva;
+        uint64_t *hashPhys;
+        uint16_t *hashIdx;
         uint64_t phys;                    // the root table
         uint32_t pages, used;
         bool busy;
@@ -204,6 +218,12 @@ private:
     uint64_t hwTick{0};
     uint32_t vmBind(uint32_t handle);
     VmCtx *vmCtx(uint32_t handle) { return handle && handle <= kMaxCtx && vm[handle - 1].busy ? &vm[handle - 1] : nullptr; }
+    static bool vmCtxAllocArrays(VmCtx &c);
+    static void vmCtxFreeArrays(VmCtx &c);
+    static bool ptAllocZeroedPage(PtPage &out);
+    void ptRefillReserve(uint32_t target);
+    bool ptPopReserveLocked(PtPage &out);
+    static void ptHashInsert(VmCtx &c, uint64_t phys, uint32_t idx);
     uint64_t *ptTable(const VmCtx &c, uint64_t phys) const;
     uint64_t ptTablePhys(VmCtx &c, uint32_t i);
     uint64_t *vmPte(VmCtx &c, uint64_t va, bool alloc);
@@ -361,6 +381,7 @@ bool PhxBringup::start(IOService *provider) {
     doorbellMap = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
     smuLock = IOLockAlloc();
     gpuLock = IOLockAlloc();
+    accelLock = IOLockAlloc();
     uint32_t dbg = 0;
     debug = PE_parse_boot_argn("phxdebug", &dbg, sizeof(dbg)) && dbg == 1;
     if (mmio) {
@@ -438,6 +459,18 @@ void PhxBringup::stop(IOService *provider) {
         sysctl_unregister_oid(&sysctl__debug_phx_hang_kills);
         gSysctlUp = 0;
     }
+    if (cachedAccel) {
+        cachedAccel->release();
+        cachedAccel = nullptr;
+    }
+    if (surfVramSym) {
+        surfVramSym->release();
+        surfVramSym = nullptr;
+    }
+    if (accelLock) {
+        IOLockFree(accelLock);
+        accelLock = nullptr;
+    }
     if (quarantine) {
         IOLog("PhxBringup: stopped with DMA resources pinned; reboot required to unload safely\n");
         IORWLockUnlock(lifecycleLock);
@@ -455,10 +488,22 @@ void PhxBringup::stop(IOService *provider) {
         sysBuf = nullptr;
     }
     gq[0].ready = gq[1].ready = false;
+    for (uint32_t i = 0; i < ptReserveCount; i++) {
+        if (ptReserve[i].md) {
+            ptReserve[i].md->release();
+            ptReserve[i].md = nullptr;
+        }
+        ptReserve[i].phys = 0;
+        ptReserve[i].kva = nullptr;
+    }
+    ptReserveCount = 0;
     for (VmCtx &c : vm) {
-        for (IOBufferMemoryDescriptor *b : c.chunk)
-            if (b)
-                b->release();
+        if (c.chunk) {
+            for (uint32_t i = 0; i < kPtMaxPages; i++)
+                if (c.chunk[i])
+                    c.chunk[i]->release();
+            vmCtxFreeArrays(c);
+        }
         c = VmCtx{};
     }
     for (HwVmid &h : hwv)
@@ -489,14 +534,93 @@ void PhxBringup::stop(IOService *provider) {
 }
 
 IOReturn PhxBringup::setPowerState(unsigned long ordinal, IOService *whichDevice) {
-    if (ordinal == 0) {
-        IOLog("PhxBringup: powerStateWillChange to sleep (state 0)\n");
-        isSleeping = true;
-    } else {
-        IOLog("PhxBringup: powerStateDidChange from sleep (state 1)\n");
-        isSleeping = false;
-    }
+    (void)whichDevice;
+    const bool sleepNow = (ordinal == 0);
+    if (gpuLock)
+        IOLockLock(gpuLock);
+    __atomic_store_n(&isSleeping, sleepNow, __ATOMIC_RELEASE);
+    if (gpuLock)
+        IOLockUnlock(gpuLock);
+    IOLog("PhxBringup: %s\n", sleepNow ? "powerStateWillChange to sleep (state 0)"
+                                      : "powerStateDidChange from sleep (state 1)");
     return IOPMAckImplied;
+}
+
+IOService *PhxBringup::retainAccel(const OSSymbol **symOut) {
+    if (!accelLock || isStopped())
+        return nullptr;
+
+    IOService *ret = nullptr;
+    IOService *stale = nullptr;
+    const OSSymbol *sym = nullptr;
+
+    IOLockLock(accelLock);
+    if (cachedAccel && !cachedAccel->isInactive()) {
+        ret = cachedAccel;
+        ret->retain();
+    } else if (cachedAccel) {
+        stale = cachedAccel;
+        cachedAccel = nullptr;
+    }
+    sym = surfVramSym;
+    IOLockUnlock(accelLock);
+
+    if (stale)
+        stale->release();
+
+    if (!sym) {
+        const OSSymbol *created = OSSymbol::withCStringNoCopy("nvSurfVram");
+        if (!created) {
+            if (ret)
+                ret->release();
+            return nullptr;
+        }
+        IOLockLock(accelLock);
+        if (!surfVramSym && !isStopped()) {
+            surfVramSym = created;
+            created = nullptr;
+        }
+        sym = surfVramSym;
+        IOLockUnlock(accelLock);
+        if (created)
+            created->release();
+        if (!sym) {
+            if (ret)
+                ret->release();
+            return nullptr;
+        }
+    }
+
+    if (!ret) {
+        IOService *found = IOService::copyMatchingService(IOService::serviceMatching("NMXAccel"));
+        if (!found)
+            return nullptr;
+        if (found->isInactive()) {
+            found->release();
+            return nullptr;
+        }
+        IOService *dropped = nullptr;
+        IOLockLock(accelLock);
+        if (!isStopped()) {
+            if (!cachedAccel || cachedAccel->isInactive()) {
+                dropped = cachedAccel;
+                cachedAccel = found;
+                found = nullptr;
+            }
+            ret = cachedAccel;
+            if (ret)
+                ret->retain();
+        }
+        IOLockUnlock(accelLock);
+        if (dropped)
+            dropped->release();
+        if (found)
+            found->release();
+    }
+
+    if (symOut)
+        *symOut = sym;
+    return ret;
 }
 
 uint32_t PhxBringup::rreg(uint32_t reg) const {
@@ -644,31 +768,148 @@ static inline void flushLine(const volatile void *p) {
     __asm__ __volatile__("clflush (%0)" ::"r"(p) : "memory");
 }
 
+bool PhxBringup::vmCtxAllocArrays(VmCtx &c) {
+    c.chunk = static_cast<IOBufferMemoryDescriptor **>(IOMallocZero(sizeof(IOBufferMemoryDescriptor *) * kPtMaxPages));
+    c.chunkPhys = static_cast<uint64_t *>(IOMallocZero(sizeof(uint64_t) * kPtMaxPages));
+    c.chunkKva = static_cast<uint64_t **>(IOMallocZero(sizeof(uint64_t *) * kPtMaxPages));
+    c.hashPhys = static_cast<uint64_t *>(IOMallocZero(sizeof(uint64_t) * kPtHashCap));
+    c.hashIdx = static_cast<uint16_t *>(IOMallocZero(sizeof(uint16_t) * kPtHashCap));
+    if (c.chunk && c.chunkPhys && c.chunkKva && c.hashPhys && c.hashIdx)
+        return true;
+    vmCtxFreeArrays(c);
+    return false;
+}
+
+void PhxBringup::vmCtxFreeArrays(VmCtx &c) {
+    if (c.chunk) {
+        IOFree(c.chunk, sizeof(IOBufferMemoryDescriptor *) * kPtMaxPages);
+        c.chunk = nullptr;
+    }
+    if (c.chunkPhys) {
+        IOFree(c.chunkPhys, sizeof(uint64_t) * kPtMaxPages);
+        c.chunkPhys = nullptr;
+    }
+    if (c.chunkKva) {
+        IOFree(c.chunkKva, sizeof(uint64_t *) * kPtMaxPages);
+        c.chunkKva = nullptr;
+    }
+    if (c.hashPhys) {
+        IOFree(c.hashPhys, sizeof(uint64_t) * kPtHashCap);
+        c.hashPhys = nullptr;
+    }
+    if (c.hashIdx) {
+        IOFree(c.hashIdx, sizeof(uint16_t) * kPtHashCap);
+        c.hashIdx = nullptr;
+    }
+}
+
+bool PhxBringup::ptAllocZeroedPage(PtPage &out) {
+    IOBufferMemoryDescriptor *b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, kPtPageBytes, kPtAddrMask);
+    if (!b)
+        return false;
+    const uint64_t pa = b->getPhysicalAddress();
+    uint8_t *p = static_cast<uint8_t *>(b->getBytesNoCopy());
+    if (!pa || !p || (pa & (kPtPageBytes - 1))) {
+        b->release();
+        return false;
+    }
+    bzero(p, kPtPageBytes);
+    for (uint32_t o = 0; o < kPtPageBytes; o += 64)
+        flushLine(p + o);
+    out.md = b;
+    out.phys = pa;
+    out.kva = reinterpret_cast<uint64_t *>(p);
+    return true;
+}
+
+void PhxBringup::ptRefillReserve(uint32_t target) {
+    if (!gpuLock)
+        return;
+    if (target > kPtReserveCap)
+        target = kPtReserveCap;
+    for (;;) {
+        IOLockLock(gpuLock);
+        const uint32_t have = ptReserveCount;
+        IOLockUnlock(gpuLock);
+        if (have >= target)
+            return;
+        uint32_t want = target - have;
+        static constexpr uint32_t kBatch = 16;
+        if (want > kBatch)
+            want = kBatch;
+        PtPage batch[kBatch];
+        uint32_t got = 0;
+        while (got < want) {
+            if (!ptAllocZeroedPage(batch[got]))
+                break;
+            got++;
+        }
+        if (!got)
+            return;
+        IOLockLock(gpuLock);
+        uint32_t stored = 0;
+        while (stored < got && ptReserveCount < kPtReserveCap)
+            ptReserve[ptReserveCount++] = batch[stored++];
+        IOLockUnlock(gpuLock);
+        for (uint32_t i = stored; i < got; i++)
+            batch[i].md->release();
+        if (got < want)
+            return;
+    }
+}
+
+bool PhxBringup::ptPopReserveLocked(PtPage &out) {
+    if (!ptReserveCount)
+        return false;
+    out = ptReserve[--ptReserveCount];
+    ptReserve[ptReserveCount] = PtPage{};
+    return true;
+}
+
+void PhxBringup::ptHashInsert(VmCtx &c, uint64_t phys, uint32_t idx) {
+    if (!c.hashPhys || !c.hashIdx || !phys)
+        return;
+    const uint32_t slot = static_cast<uint32_t>(((phys >> 12) * 0x9e3779b97f4a7c15ull) & (kPtHashCap - 1));
+    for (uint32_t probe = 0; probe < kPtHashCap; probe++) {
+        const uint32_t pos = (slot + probe) & (kPtHashCap - 1);
+        if (!c.hashPhys[pos] || c.hashPhys[pos] == phys) {
+            c.hashPhys[pos] = phys;
+            c.hashIdx[pos] = static_cast<uint16_t>(idx);
+            return;
+        }
+    }
+}
+
 uint64_t *PhxBringup::ptTable(const VmCtx &c, uint64_t phys) const {
-    for (uint32_t i = 0; i < kPtChunks && c.chunk[i]; i++)
-        if (phys - c.chunkPhys[i] < kPtChunkBytes)
-            return reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(c.chunk[i]->getBytesNoCopy()) + (phys - c.chunkPhys[i]));
+    if (!c.hashPhys || !c.hashIdx || !c.chunkKva || !phys)
+        return nullptr;
+    const uint32_t slot = static_cast<uint32_t>(((phys >> 12) * 0x9e3779b97f4a7c15ull) & (kPtHashCap - 1));
+    for (uint32_t probe = 0; probe < kPtHashCap; probe++) {
+        const uint32_t pos = (slot + probe) & (kPtHashCap - 1);
+        const uint64_t key = c.hashPhys[pos];
+        if (!key)
+            return nullptr;
+        if (key == phys)
+            return c.chunkKva[c.hashIdx[pos]];
+    }
     return nullptr;
 }
 
-// The physical address of table i, allocating (zeroed, flushed) the chunk it lives in; 0 when that fails.
+// The physical address of table i, popped from the pre-filled 4 KiB page-table reserve; 0 when empty.
 uint64_t PhxBringup::ptTablePhys(VmCtx &c, uint32_t i) {
-    const uint32_t k = i / kPtChunkPages;
-    if (k >= kPtChunks)
+    if (i >= kPtMaxPages || !c.chunk || !c.chunkPhys || !c.chunkKva)
         return 0;
-    if (!c.chunk[k]) {
-        IOBufferMemoryDescriptor *b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-            kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, kPtChunkBytes, kPtAddrMask);
-        if (!b)
+    if (!c.chunk[i]) {
+        PtPage page{};
+        if (!ptPopReserveLocked(page))
             return 0;
-        uint8_t *p = static_cast<uint8_t *>(b->getBytesNoCopy());
-        bzero(p, kPtChunkBytes);
-        for (uint32_t o = 0; o < kPtChunkBytes; o += 64)
-            flushLine(p + o);
-        c.chunk[k] = b;
-        c.chunkPhys[k] = b->getPhysicalAddress();
+        c.chunk[i] = page.md;
+        c.chunkPhys[i] = page.phys;
+        c.chunkKva[i] = page.kva;
+        ptHashInsert(c, page.phys, i);
     }
-    return c.chunkPhys[k] + static_cast<uint64_t>(i % kPtChunkPages) * 4096;
+    return c.chunkPhys[i];
 }
 
 uint64_t *PhxBringup::vmPte(VmCtx &c, uint64_t va, bool alloc) {
@@ -711,40 +952,101 @@ bool PhxBringup::vmFlushTlb(uint32_t vmid) {
 // Takes a free context: empty tables (root only), no hardware VMID until its first submission. Returns its handle,
 // 0 when all kMaxCtx are in use.
 uint32_t PhxBringup::vmidAlloc() {
-    if (!gpuReady() || !vmHealthy())
+    if (!gpuReady() || !vmHealthy() || isStopped() || isGpuSleeping())
         return 0;
-    IOLockLock(gpuLock);
-    for (uint32_t i = 0; i < kMaxCtx; i++) {
-        VmCtx &c = vm[i];
-        if (c.busy)
-            continue;
-        if (!c.chunk[0]) {
-            c.phys = ptTablePhys(c, 0);
-            if (!c.phys)
-                break;
-            c.pages = kPtChunks * kPtChunkPages;
+    ptRefillReserve(16);
+    VmCtx scratch{};
+    bool allocatedScratch = false;
+
+    for (int pass = 0; pass < 2; pass++) {
+        IOLockLock(gpuLock);
+        if (!gpuReady() || !vmHealthy() || isStopped() || isGpuSleeping()) {
+            IOLockUnlock(gpuLock);
+            break;
         }
-        c.used = 1;
-        c.busy = true;
-        c.hw = 0;
+        int freeIdx = -1;
+        for (uint32_t i = 0; i < kMaxCtx; i++) {
+            if (!vm[i].busy) {
+                freeIdx = static_cast<int>(i);
+                break;
+            }
+        }
+        if (freeIdx < 0) {
+            IOLockUnlock(gpuLock);
+            break;
+        }
+        VmCtx &c = vm[freeIdx];
+        if (c.chunk && (c.chunk[0] || ptReserveCount > 0)) {
+            if (!c.chunk[0]) {
+                c.phys = ptTablePhys(c, 0);
+                if (!c.phys) {
+                    IOLockUnlock(gpuLock);
+                    break;
+                }
+                c.pages = kPtMaxPages;
+            }
+            c.used = 1;
+            c.busy = true;
+            c.hw = 0;
+            IOLockUnlock(gpuLock);
+            if (allocatedScratch)
+                vmCtxFreeArrays(scratch);
+            return static_cast<uint32_t>(freeIdx + 1);
+        }
+        if (!c.chunk && allocatedScratch) {
+            c.chunk = scratch.chunk;
+            c.chunkPhys = scratch.chunkPhys;
+            c.chunkKva = scratch.chunkKva;
+            c.hashPhys = scratch.hashPhys;
+            c.hashIdx = scratch.hashIdx;
+            allocatedScratch = false;
+            scratch = VmCtx{};
+            c.phys = ptTablePhys(c, 0);
+            if (!c.phys) {
+                IOLockUnlock(gpuLock);
+                break;
+            }
+            c.pages = kPtMaxPages;
+            c.used = 1;
+            c.busy = true;
+            c.hw = 0;
+            IOLockUnlock(gpuLock);
+            return static_cast<uint32_t>(freeIdx + 1);
+        }
+        const bool needArrays = !c.chunk;
         IOLockUnlock(gpuLock);
-        return i + 1;
+        if (pass == 0) {
+            if (needArrays && !allocatedScratch) {
+                if (!vmCtxAllocArrays(scratch))
+                    break;
+                allocatedScratch = true;
+            }
+            ptRefillReserve(16);
+        }
     }
-    IOLockUnlock(gpuLock);
+    if (allocatedScratch)
+        vmCtxFreeArrays(scratch);
     return 0;
 }
 
 // Points a hardware VMID at the context's tables for a submission (gpuLock held): the one it already has, a free one,
-// or the least recently used one whose submissions the GPU has all finished (waits for one, bounded ~2 s). 0 on timeout.
+// or the least recently used one whose submissions the GPU has all finished (waits without holding gpuLock, bounded ~2 s).
+// Re-validates all state after re-acquiring gpuLock and rolls back metadata if TLB invalidation fails.
 uint32_t PhxBringup::vmBind(uint32_t handle) {
-    VmCtx &c = vm[handle - 1];
-    const uint64_t now = ++hwTick;
-    if (c.hw) {
-        hwv[c.hw - kFirstUserVmid].lastUse = now;
-        return c.hw;
+    if (isStopped() || isGpuSleeping() || !vmHealthy() || !vmCtx(handle))
+        return 0;
+    if (vm[handle - 1].hw) {
+        hwv[vm[handle - 1].hw - kFirstUserVmid].lastUse = ++hwTick;
+        return vm[handle - 1].hw;
     }
     int pick = -1;
     for (int spin = 0; pick < 0; spin++) {
+        if (isStopped() || isGpuSleeping() || !vmHealthy() || !vmCtx(handle))
+            return 0;
+        if (vm[handle - 1].hw) {
+            hwv[vm[handle - 1].hw - kFirstUserVmid].lastUse = ++hwTick;
+            return vm[handle - 1].hw;
+        }
         const uint64_t done = gpuRetiredLocked();
         uint64_t oldest = ~0ull;
         for (uint32_t i = 0; i < kNumUserVmids; i++) {
@@ -759,17 +1061,23 @@ uint32_t PhxBringup::vmBind(uint32_t handle) {
         }
         if (pick >= 0)
             break;
-        if (spin > 40000)
+        if (spin >= 2016)
             return 0;
-        IODelay(50);
+        IOLockUnlock(gpuLock);
+        if (spin < 16)
+            IODelay(50);
+        else
+            IOSleep(1);
+        IOLockLock(gpuLock);
     }
+    VmCtx &c = vm[handle - 1];
     HwVmid &h = hwv[pick];
     if (h.ctx)
         vm[h.ctx - 1].hw = 0;
     h.ctx = handle;
     h.binding++;
     h.lastSeq = 0;
-    h.lastUse = now;
+    h.lastUse = ++hwTick;
     const uint32_t vmid = kFirstUserVmid + static_cast<uint32_t>(pick);
     c.hw = vmid;
     wreg(kRegCtx0BaseLo + 2 * vmid, static_cast<uint32_t>(c.phys | 3));
@@ -779,8 +1087,11 @@ uint32_t PhxBringup::vmBind(uint32_t handle) {
     wreg(kRegCtx0StartLo + 2 * vmid + 1, 0);
     wreg(kRegCtx0EndLo + 2 * vmid, 0xffffffff);
     wreg(kRegCtx0EndLo + 2 * vmid + 1, 0xf);
-    if (!vmFlushTlb(vmid))
+    if (!vmFlushTlb(vmid)) {
+        h.ctx = 0;
+        c.hw = 0;
         return 0;
+    }
     return vmid;
 }
 
@@ -796,12 +1107,17 @@ bool PhxBringup::vmidFree(uint32_t handle, uint64_t lastSeq) {
         return true;
     }
     VmCtx &c = vm[handle - 1];
-    for (uint32_t k = 0; k < kPtChunks && c.chunk[k] && k * kPtChunkPages < c.used; k++) {
-        const uint32_t n = c.used - k * kPtChunkPages < kPtChunkPages ? c.used - k * kPtChunkPages : kPtChunkPages;
-        uint8_t *p = static_cast<uint8_t *>(c.chunk[k]->getBytesNoCopy());
-        bzero(p, static_cast<size_t>(n) * 4096);
-        for (uint32_t o = 0; o < n * 4096u; o += 64)
-            flushLine(p + o);
+    if (c.hw && isGpuSleeping()) {
+        IOLockUnlock(gpuLock);
+        return false;
+    }
+    for (uint32_t k = 0; k < c.used && k < kPtMaxPages; k++) {
+        if (c.chunkKva && c.chunkKva[k]) {
+            uint8_t *p = reinterpret_cast<uint8_t *>(c.chunkKva[k]);
+            bzero(p, kPtPageBytes);
+            for (uint32_t o = 0; o < kPtPageBytes; o += 64)
+                flushLine(p + o);
+        }
     }
     if (c.hw) {
         if (!vmFlushTlb(c.hw)) {
@@ -868,8 +1184,17 @@ IOReturn PhxBringup::vmMap(uint32_t handle, uint64_t va, IOMemoryDescriptor *md,
     if (!md || !size || ((va | off | size) & 4095) ||
         !phxRangeFits(off, size, md->getLength()) || !phxRangeFits(va, size, 1ull << 48))
         return kIOReturnBadArgument;
+    if (isStopped() || isGpuSleeping() || !vmHealthy())
+        return kIOReturnNotReady;
+    const uint64_t endVa = va + size - 1;
+    const uint64_t leafNeed = (endVa >> 21) - (va >> 21) + 1;
+    const uint64_t pdNeed = (endVa >> 30) - (va >> 30) + 1;
+    const uint64_t pdptNeed = (endVa >> 39) - (va >> 39) + 1;
+    const uint64_t sumNeed = leafNeed + pdNeed + pdptNeed;
+    const uint32_t need = sumNeed > kPtReserveCap ? kPtReserveCap : static_cast<uint32_t>(sumNeed);
+    ptRefillReserve(need);
     IOLockLock(gpuLock);
-    if (!vmHealthy() || !vmCtx(handle)) {
+    if (isStopped() || isGpuSleeping() || !vmHealthy() || !vmCtx(handle)) {
         IOLockUnlock(gpuLock);
         return kIOReturnNotReady;
     }
@@ -909,7 +1234,7 @@ IOReturn PhxBringup::vmMap(uint32_t handle, uint64_t va, IOMemoryDescriptor *md,
 
 IOReturn PhxBringup::vmUnmap(uint32_t handle, uint64_t va, uint64_t size) {
     IOLockLock(gpuLock);
-    if (!vmHealthy() || !vmCtx(handle)) {
+    if (isStopped() || isGpuSleeping() || !vmHealthy() || !vmCtx(handle)) {
         IOLockUnlock(gpuLock);
         return kIOReturnNotReady;
     }
@@ -933,7 +1258,7 @@ void PhxBringup::ringPut(GpuQueue &q, uint32_t idx, uint32_t value) {
 
 uint64_t PhxBringup::queueFence(const GpuQueue &q) const {
     const volatile uint32_t *f = reinterpret_cast<const volatile uint32_t *>(fbAper->getVirtualAddress() + q.fenceOff);
-    return static_cast<uint64_t>(f[0]) | (static_cast<uint64_t>(f[1]) << 32);
+    return phxReadFence64(f);
 }
 
 // Everything up to the returned sequence has finished: the oldest submission still running on any queue, minus one.
@@ -961,39 +1286,80 @@ IOReturn PhxBringup::gpuSubmit(uint32_t handle, bool gfx, const uint64_t *ibVa, 
     if (!gpuLock)
         return kIOReturnNotReady;
     IOLockLock(gpuLock);
-    // graphics IBs go to the gfx queue and compute IBs to the compute queue; with one of them missing, the other runs both
-    GpuQueue *qp = gfx ? (gq[1].ready ? &gq[1] : &gq[0]) : (gq[0].ready ? &gq[0] : &gq[1]);
-    if (!vmHealthy() || !qp->ready || !vmCtx(handle)) {
-        IOLockUnlock(gpuLock);
-        return kIOReturnNotReady;
-    }
-    GpuQueue &q = *qp;
     const uint32_t need = n * 4 + 8;
-    if (need + 16 > q.ringDw) {
-        IOLockUnlock(gpuLock);
-        return kIOReturnBadArgument;
-    }
-    // Ring space and the 64-entry history: retire finished entries, wait for the oldest one if needed (bounded, ~2 s).
-    for (int spin = 0;; spin++) {
-        const uint64_t done = queueFence(q);
-        while (q.head != q.tail && q.fseq[q.head & 63] <= done) {
-            q.doneEnd = q.fend[q.head & 63];
-            q.head++;
+    uint32_t vmid = 0;
+    GpuQueue *qp = nullptr;
+    for (int outer = 0;; outer++) {
+        // graphics IBs go to the gfx queue and compute IBs to the compute queue; with one of them missing, the other runs both
+        for (int spin = 0;; spin++) {
+            if (isStopped() || isGpuSleeping() || !vmHealthy() || !vmCtx(handle)) {
+                IOLockUnlock(gpuLock);
+                return kIOReturnNotReady;
+            }
+            qp = gfx ? (gq[1].ready ? &gq[1] : &gq[0]) : (gq[0].ready ? &gq[0] : &gq[1]);
+            if (!qp || !qp->ready) {
+                IOLockUnlock(gpuLock);
+                return kIOReturnNotReady;
+            }
+            if (need + 16 > qp->ringDw) {
+                IOLockUnlock(gpuLock);
+                return kIOReturnBadArgument;
+            }
+            GpuQueue &q = *qp;
+            const uint64_t done = queueFence(q);
+            while (q.head != q.tail && q.fseq[q.head & 63] <= done) {
+                q.doneEnd = q.fend[q.head & 63];
+                q.head++;
+            }
+            if (q.tail - q.head < 63 && q.wptr + need - q.doneEnd <= q.ringDw - 16)
+                break;
+            if (spin >= 2016) {
+                IOLockUnlock(gpuLock);
+                return kIOReturnBusy;
+            }
+            IOLockUnlock(gpuLock);
+            if (spin < 16)
+                IODelay(50);
+            else
+                IOSleep(1);
+            IOLockLock(gpuLock);
         }
-        if (q.tail - q.head < 63 && q.wptr + need - q.doneEnd <= q.ringDw - 16)
+        vmid = vmBind(handle);
+        if (!vmid) {
+            const IOReturn result = !vmHealthy() ? kIOReturnTimeout
+                                  : (isStopped() || isGpuSleeping() || !vmCtx(handle)) ? kIOReturnNotReady
+                                  : kIOReturnBusy;
+            IOLockUnlock(gpuLock);
+            return result;
+        }
+        // vmBind may have dropped gpuLock while waiting for a free VMID; re-verify queue readiness and ring space.
+        if (isStopped() || isGpuSleeping() || !vmHealthy() || !vmCtx(handle)) {
+            IOLockUnlock(gpuLock);
+            return !vmHealthy() ? kIOReturnTimeout : kIOReturnNotReady;
+        }
+        qp = gfx ? (gq[1].ready ? &gq[1] : &gq[0]) : (gq[0].ready ? &gq[0] : &gq[1]);
+        if (!qp || !qp->ready) {
+            IOLockUnlock(gpuLock);
+            return kIOReturnNotReady;
+        }
+        if (need + 16 > qp->ringDw) {
+            IOLockUnlock(gpuLock);
+            return kIOReturnBadArgument;
+        }
+        GpuQueue &qCheck = *qp;
+        const uint64_t doneCheck = queueFence(qCheck);
+        while (qCheck.head != qCheck.tail && qCheck.fseq[qCheck.head & 63] <= doneCheck) {
+            qCheck.doneEnd = qCheck.fend[qCheck.head & 63];
+            qCheck.head++;
+        }
+        if (qCheck.tail - qCheck.head < 63 && qCheck.wptr + need - qCheck.doneEnd <= qCheck.ringDw - 16)
             break;
-        if (spin > 40000) {
+        if (outer >= 8) {
             IOLockUnlock(gpuLock);
             return kIOReturnBusy;
         }
-        IODelay(50);
     }
-    const uint32_t vmid = vmBind(handle);
-    if (!vmid) {
-        const IOReturn result = vmHealthy() ? kIOReturnBusy : kIOReturnTimeout;
-        IOLockUnlock(gpuLock);
-        return result;
-    }
+    GpuQueue &q = *qp;
     uint32_t k = 0;
     for (uint32_t i = 0; i < n; i++) {
         ringPut(q, k++, 0xC0023F00);                               // INDIRECT_BUFFER
@@ -1059,6 +1425,10 @@ void PhxBringup::hangCheck() {
     uint64_t limit;
     nanoseconds_to_absolutetime(static_cast<uint64_t>(limitMs) * 1000000ull, &limit);
     IOLockLock(gpuLock);
+    if (isStopped() || isGpuSleeping()) {
+        IOLockUnlock(gpuLock);
+        return;
+    }
     const uint64_t now = mach_absolute_time();
     for (GpuQueue &q : gq) {
         if (!q.ready)
@@ -1523,6 +1893,10 @@ void PhxBringup::reapClients() {
         return;
     IOAccelPhxNativeClient *ready = nullptr;
     IOLockLock(gpuLock);
+    if (isStopped() || isGpuSleeping()) {
+        IOLockUnlock(gpuLock);
+        return;
+    }
     const uint64_t retired = gpuRetiredLocked();
     IOAccelPhxNativeClient **link = &retiringClients;
     while (*link) {
@@ -2352,25 +2726,12 @@ static_assert(sizeof(PhxSurfShareEsc) == 40, "NVRMSurfShareEsc layout");
 IOReturn IOAccelPhxNativeClient::doSurfGpuMark(IOExternalMethodArguments *a) {
     if (!shape(a, 2, 1, 0, 0))
         return kIOReturnBadArgument;
-    static IOService *accel;
-    static const OSSymbol *fn;
-    if (!accel || accel->isInactive()) {
-        if (accel) {
+    const OSSymbol *fn = nullptr;
+    IOService *accel = owner ? owner->retainAccel(&fn) : nullptr;
+    if (!accel || !fn) {
+        if (accel)
             accel->release();
-            accel = nullptr;
-        }
-        IOService *s = IOService::copyMatchingService(IOService::serviceMatching("NMXAccel"));
-        if (s && !OSCompareAndSwapPtr(nullptr, s, (void *volatile *)&accel))
-            s->release();
-        if (!accel)
-            return kIOReturnNotFound;
-    }
-    if (!fn) {
-        const OSSymbol *f = OSSymbol::withCStringNoCopy("nvSurfVram");
-        if (f && !OSCompareAndSwapPtr(nullptr, (void *)f, (void *volatile *)&fn))
-            f->release();
-        if (!fn)
-            return kIOReturnNoMemory;
+        return kIOReturnNotFound;
     }
     PhxSurfShareEsc e{};
     e.version = 2;
@@ -2378,6 +2739,7 @@ IOReturn IOAccelPhxNativeClient::doSurfGpuMark(IOExternalMethodArguments *a) {
     e.plane = 0x80000000u | (a->scalarInput[1] ? 1u : 0u);   // NVRM_SS_PLANE_GPU_MARK | pending
     e.status = 0x80000002u;                                    // NVRM_SS_OFF unless the accelerator answers
     const IOReturn r = accel->callPlatformFunction(fn, false, &e, task, reinterpret_cast<void *>(0xE3), nullptr);   // NVRM_ESC_SURF_DIRTY
+    accel->release();
     a->scalarOutput[0] = r == kIOReturnSuccess ? e.status : 0x80000002u;
     return kIOReturnSuccess;
 }

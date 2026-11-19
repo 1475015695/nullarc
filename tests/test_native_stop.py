@@ -39,16 +39,25 @@ template<class... T> void IOLog(const char *, T...) {}
 struct IOService { unsigned superStops=0; void stop(IOService *) { superStops++; } };
 struct Resource { unsigned releases=0; void release() { releases++; } };
 using IOBufferMemoryDescriptor=Resource;
+using OSSymbol=Resource;
 struct PhxBringup : IOService {
+    static constexpr uint32_t kPtMaxPages=1, kPtReserveCap=1;
     IORWLock lifecycle; IORWLock *lifecycleLock=&lifecycle;
     bool stopped=false;
     bool isStopped() const { return __atomic_load_n(&stopped,__ATOMIC_ACQUIRE); }
-    Lock gpuMutex, smuMutex; Lock *gpuLock=&gpuMutex, *smuLock=&smuMutex;
+    Lock gpuMutex, smuMutex, accelMutex;
+    Lock *gpuLock=&gpuMutex, *smuLock=&smuMutex, *accelLock=&accelMutex;
     Resource resource;
     Resource *fbAper=&resource, *sysBuf=nullptr, *doorbellMap=&resource;
     Resource *mmio=&resource, *pci=&resource;
+    Resource *cachedAccel=nullptr, *surfVramSym=nullptr;
+    struct PtPage { Resource *md=nullptr; uint64_t phys=0; uint64_t *kva=nullptr; } ptReserve[kPtReserveCap]{};
+    uint32_t ptReserveCount=0;
     struct Queue { bool ready=false; } gq[2];
-    struct VmCtx { Resource *chunk[1]{}; } vm[1];
+    struct VmCtx { Resource **chunk=nullptr; } vm[1];
+    Resource *chunks[1]{};
+    static unsigned arrayFrees;
+    static void vmCtxFreeArrays(VmCtx &c) { c.chunk=nullptr; arrayFrees++; }
     struct HwVmid { unsigned ctx=0; } hwv[1];
     void *hangCall=this;
     bool hangStop=false;
@@ -60,6 +69,7 @@ struct PhxBringup : IOService {
     void endAccess();
     void stop(IOService *);
 };
+unsigned PhxBringup::arrayFrees=0;
 '''
         for signature in ('bool PhxBringup::beginAccess()',
                           'void PhxBringup::endAccess()',
@@ -68,7 +78,9 @@ struct PhxBringup : IOService {
         code += r'''
 int main() {
     PhxBringup active;
-    active.gq[0].ready=true; active.vm[0].chunk[0]=&active.resource;
+    active.chunks[0]=&active.resource; active.vm[0].chunk=active.chunks;
+    active.cachedAccel=&active.resource; active.surfVramSym=&active.resource;
+    active.gq[0].ready=true;
     assert(active.beginAccess());
     std::thread stopper([&] { active.stop(nullptr); });
     while (!active.lifecycle.writerWaiting) std::this_thread::yield();
@@ -76,7 +88,8 @@ int main() {
     active.endAccess();
     stopper.join();
     assert(active.isStopped() && !active.beginAccess());
-    assert(active.retains==1 && !active.resource.releases && !lockFrees);
+    assert(active.retains==1 && active.resource.releases==2 && lockFrees==1);
+    assert(!active.cachedAccel && !active.surfVramSym && !active.accelLock);
     assert(active.fbAper && active.mmio && active.gpuLock && active.vm[0].chunk[0]);
     assert(!active.hangCall && active.hangStop && active.superStops==1);
     assert(cancelCalls==1 && callFrees==1);
@@ -85,11 +98,13 @@ int main() {
     PhxBringup debug;
     debug.sysBuf=&debug.resource;
     debug.stop(nullptr);
-    assert(debug.retains==1 && !debug.resource.releases && debug.sysBuf);
+    assert(debug.retains==1 && !debug.resource.releases && debug.sysBuf && lockFrees==2);
     PhxBringup idle;
-    idle.vm[0].chunk[0]=&idle.resource;
+    idle.chunks[0]=&idle.resource; idle.vm[0].chunk=idle.chunks;
+    idle.ptReserve[0].md=&idle.resource; idle.ptReserveCount=1;
     idle.stop(nullptr);
-    assert(!idle.retains && idle.resource.releases==5 && lockFrees==2);
+    assert(!idle.retains && idle.resource.releases==6 && !idle.ptReserveCount && lockFrees==5);
+    assert(PhxBringup::arrayFrees==1);
     assert(!idle.fbAper && !idle.mmio && !idle.gpuLock);
     assert(!idle.beginAccess() && idle.superStops==1);
     PhxBringup allocationFailure;

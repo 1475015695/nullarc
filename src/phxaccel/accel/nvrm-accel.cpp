@@ -59,7 +59,11 @@ uint64_t mach_absolute_time(void);
 void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
 void proc_selfname(char *buf, int size);
 }
-extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+static bool phxFirebatEcAllowed()
+{
+    int allow = 0;
+    return PE_parse_boot_argn("phxfirebat_ec", &allow, sizeof(allow)) && allow == 1;
+}
 
 static volatile SInt64 gCntVmAlloc, gCntVmAllocBytes, gCntVmDealloc, gCntVmDeallocBytes, gCntVmRefused,
                        gCntResNew, gCntResFree, gCntMapCommit, gCntMapRelease, gCntMapFree;
@@ -339,8 +343,13 @@ public:
     static constexpr uint32_t kHeadlessDeadlineSec = 60;   // chosen: NVRMFB heads publish within ~20 s of start (#76 log)
     struct thread_call *fHeadlessCall = nullptr;
     struct thread_call *fFanCall = nullptr;
+    IOMemoryMap *fFirebatEcMap = nullptr;
+    volatile uint8_t *fFirebatEc = nullptr;
+    volatile bool fStopping = false;
     static void fanWorker(void *p0, void *p1);
     void armFanWorker() {
+        if (!fFirebatEc || !phxFirebatEcAllowed() || __atomic_load_n(&fStopping, __ATOMIC_ACQUIRE))
+            return;
         fFanCall = thread_call_allocate(&NVAccel::fanWorker, this);
         if (fFanCall) {
             uint64_t when = 0;
@@ -689,12 +698,21 @@ public:
             setProperty("NVAccelSurfaceWait", 1ULL, 32);
             registerService(); ALOG("registerService() called — Metal can now find MetalPluginName=%s", "NVMTLDriver");
             gAccel = this; gEnableAccel = &NVAccel::enableFromHook;
-            if (vm_offset_t va = ml_io_map(0xFE0B0400, 0x100)) {
-                volatile uint8_t *ec = (volatile uint8_t *)va;
-                ec[0x04] = 0x01; // OSFG = 1 (OS handshake alive)
-                ec[0x18] = 0x00; // FFFG = 0 (kill 100% full fan boost if active)
-                ec[0x32] = 0x82; // FCMI = 0x82 (Quiet Mode)
-                IOLog("PhxAccel: Firebat EC init: OSFG=1, FFFG=0, FCMI=0x82, FCMO=0x%02x\n", ec[0x31]);
+            if (phxFirebatEcAllowed()) {
+                IODeviceMemory *ecMem = IODeviceMemory::withRange((IOPhysicalAddress)0xFE0B0400ull, (IOPhysicalLength)0x100u);
+                if (ecMem) {
+                    fFirebatEcMap = ecMem->map();
+                    ecMem->release();
+                    if (fFirebatEcMap)
+                        fFirebatEc = (volatile uint8_t *)(uintptr_t)fFirebatEcMap->getVirtualAddress();
+                }
+                if (fFirebatEc) {
+                    volatile uint8_t *ec = fFirebatEc;
+                    ec[0x04] = 0x01; // OSFG = 1 (OS handshake alive)
+                    ec[0x18] = 0x00; // FFFG = 0 (kill 100% full fan boost if active)
+                    ec[0x32] = 0x82; // FCMI = 0x82 (Quiet Mode)
+                    IOLog("PhxAccel: Firebat EC init: OSFG=1, FFFG=0, FCMI=0x82, FCMO=0x%02x\n", ec[0x31]);
+                }
             }
             for (unsigned i = 0; i < NV_CARRIERS; i++) {
                 IOAccelNVRMCarrier *c = OSTypeAlloc(IOAccelNVRMCarrier);
@@ -756,10 +774,17 @@ public:
         return r;
     }
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE {
+        __atomic_store_n(&fStopping, true, __ATOMIC_RELEASE);
         if (fFanCall) {
             thread_call_cancel(fFanCall);
             while (!thread_call_free(fFanCall)) { thread_call_cancel(fFanCall); IOSleep(5); }
             fFanCall = nullptr;
+        }
+        if (gAccel == this) gAccel = nullptr;
+        if (fFirebatEcMap) {
+            fFirebatEc = nullptr;
+            fFirebatEcMap->release();
+            fFirebatEcMap = nullptr;
         }
         ALOG("stop");
         IOGraphicsAccelerator2::stop(provider);
@@ -869,10 +894,12 @@ void *NVResource::getApertureMemoryDescriptor(unsigned long long *a0)
 }
 
 static void nvSVForgetResource(NVResource *resource);
+static void nvAccelIopCacheForget(const NVResource *res, const NVVidMemory *vm, const void *skipRelease);
 
 void NVResource::free()
 {
     nvSVForgetResource(this);
+    nvAccelIopCacheForget(this, nullptr, this);
     if (fApDesc) { fApDesc->release(); fApDesc = nullptr; }
     OSAddAtomic64(1, &gCntResFree);
     IOAccelResource2::free();
@@ -937,6 +964,7 @@ bool NVVidMemory::allocPhysical()
 
 void NVVidMemory::deallocPhysical()
 {
+    nvAccelIopCacheForget(nullptr, this, nullptr);
     if (fScanout) {
         ALOG("NVVidMemory::deallocPhysical(%p): SCANOUT -- not ours to free, only forgetting it", this);
         fPhys = 0; fBytes = 0; fScanout = false;
@@ -980,6 +1008,7 @@ void NVVidMemory::releaseParked()
 
 void NVVidMemory::free()
 {
+    nvAccelIopCacheForget(nullptr, this, this);
     if (fRmHandle && !fScanout) {
         releaseVram(fRmHandle, fKva, fBytes, fAllocationCookie);
         fRmHandle = nullptr; fKva = nullptr; fPhys = 0; fBytes = 0; fAllocationCookie = 0;
@@ -1189,7 +1218,10 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         // stale, one-colour buffer on the panel every other frame: full-screen flicker, 5 of 40 flicker recordings
         // (1.13-1.14.1), nvaccel_iop_blank about half of every copied frame, never on machines whose frames all flip.
         // Such a frame now keeps the previous picture on the panel instead.
-        nvSurfWaitReady(s->getSurfaceID());   // a copied frame is read here, so its GPU work must be done first
+        if (!nvSurfWaitReady(s->getSurfaceID())) {   // a copied frame is read here, so skip copying on wait timeout
+            OSAddAtomic64(1, &gCntIopCopySkip);
+            return kIOReturnSuccess;
+        }
         if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
         const unsigned fmt = s->getPixelFormat();
         // WindowServer moves the display surface to 10-bit 'l10r' (ARGB2101010) once colour management is up; the panel
@@ -1345,46 +1377,50 @@ SYSCTL_PROC(_debug, OID_AUTO, nvaccelfb, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCK
             NULL, 0, nvaccelfb_sysctl, "I",
             "register the NVIDIA framebuffer with the accelerator display machine (1 = found_framebuffer, 2 = family sweep)");
 
-extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+static bool phxFirebatEcAllowed()
+{
+    int allow = 0;
+    return PE_parse_boot_argn("phxfirebat_ec", &allow, sizeof(allow)) && allow == 1;
+}
 
 static int gFirebatFanMode = 2; // Default to Quiet (2)
 
 void NVAccel::fanWorker(void *p0, void *p1)
 {
+    (void)p1;
     NVAccel *me = (NVAccel *)p0;
-    if (!me || me != gAccel) return;
+    if (!me || me != gAccel || __atomic_load_n(&me->fStopping, __ATOMIC_ACQUIRE) ||
+        !phxFirebatEcAllowed() || !me->fFirebatEc)
+        return;
 
-    vm_offset_t va = ml_io_map(0xFE0B0400, 0x100);
-    if (va) {
-        volatile uint8_t *ec = (volatile uint8_t *)va;
-        ec[0x04] = 0x01; // keep OS handshake alive
-        ec[0x18] = 0x00; // kill 100% full fan blast
-        ec[0x17] = 0x00;
+    volatile uint8_t *ec = me->fFirebatEc;
+    ec[0x04] = 0x01; // keep OS handshake alive
+    ec[0x18] = 0x00; // kill 100% full fan blast
+    ec[0x17] = 0x00;
 
-        uint8_t cput = ec[0x70];
-        uint8_t target_fan = 1;
+    uint8_t cput = ec[0x70];
+    uint8_t target_fan = 1;
 
-        if (gFirebatFanMode >= 10 && gFirebatFanMode <= 16) {
-            target_fan = (uint8_t)(gFirebatFanMode - 10);
-        } else if (gFirebatFanMode == 1) { // Turbo
-            target_fan = (cput > 85) ? 6 : (cput > 75) ? 5 : (cput > 65) ? 4 : 3;
-        } else if (gFirebatFanMode == 0) { // Balanced
-            target_fan = (cput > 88) ? 6 : (cput > 80) ? 5 : (cput > 70) ? 3 : 2;
-        } else { // Quiet (2) / Office (3)
-            // Zero-RPM silent curve up to 65°C
-            if (cput < 65) target_fan = 0;
-            else if (cput < 75) target_fan = 1;
-            else if (cput < 85) target_fan = 2;
-            else if (cput < 92) target_fan = 3;
-            else if (cput < 96) target_fan = 5;
-            else target_fan = 6; // safety emergency
-        }
-
-        if (ec[0x74] != target_fan) ec[0x74] = target_fan;
-        if (ec[0x76] != target_fan) ec[0x76] = target_fan;
+    if (gFirebatFanMode >= 10 && gFirebatFanMode <= 16) {
+        target_fan = (uint8_t)(gFirebatFanMode - 10);
+    } else if (gFirebatFanMode == 1) { // Turbo
+        target_fan = (cput > 85) ? 6 : (cput > 75) ? 5 : (cput > 65) ? 4 : 3;
+    } else if (gFirebatFanMode == 0) { // Balanced
+        target_fan = (cput > 88) ? 6 : (cput > 80) ? 5 : (cput > 70) ? 3 : 2;
+    } else { // Quiet (2) / Office (3)
+        // Zero-RPM silent curve up to 65°C
+        if (cput < 65) target_fan = 0;
+        else if (cput < 75) target_fan = 1;
+        else if (cput < 85) target_fan = 2;
+        else if (cput < 92) target_fan = 3;
+        else if (cput < 96) target_fan = 5;
+        else target_fan = 6; // safety emergency
     }
 
-    if (me->fFanCall) {
+    if (ec[0x74] != target_fan) ec[0x74] = target_fan;
+    if (ec[0x76] != target_fan) ec[0x76] = target_fan;
+
+    if (me->fFanCall && !__atomic_load_n(&me->fStopping, __ATOMIC_ACQUIRE)) {
         uint64_t when = 0;
         clock_interval_to_deadline(1000, kMillisecondScale, &when);
         thread_call_enter_delayed(me->fFanCall, when);
@@ -1393,9 +1429,10 @@ void NVAccel::fanWorker(void *p0, void *p1)
 
 static int firebat_fan_mode_sysctl SYSCTL_HANDLER_ARGS
 {
-    vm_offset_t va = ml_io_map(0xFE0B0400, 0x100);
-    if (!va) return EIO;
-    volatile uint8_t *ec = (volatile uint8_t *)va;
+    NVAccel *a = NVAccel::gAccel;
+    if (!phxFirebatEcAllowed() || !a || !a->fFirebatEc || __atomic_load_n(&a->fStopping, __ATOMIC_ACQUIRE))
+        return ENODEV;
+    volatile uint8_t *ec = a->fFirebatEc;
 
     int val = gFirebatFanMode;
     IOLog("PhxAccel: Firebat diag: CPUT=%d C, Fan0=%d, Fan1=%d, FCMO=0x%02x, FCMI=0x%02x, FFFG=0x%02x, OSFG=0x%02x, FanMode=%d\n",
@@ -1527,7 +1564,7 @@ static int gSurfGpuOn = 1;
 static SInt64 gCntSurfMarks, gCntSurfWaits, gCntSurfTimeouts;
 static int gSurfWaitMaxUs;
 static const unsigned kSurfGpuWaitMs = 100;   // a GPU that has not finished a composite in 100 ms is hung; flip anyway
-struct NVSurfPending { unsigned int id; unsigned int seq; };
+struct NVSurfPending { unsigned int id; unsigned int seq; unsigned int refs; };
 static NVSurfPending gSurfPend[32];
 static unsigned int gSurfPendSeq;
 static IOLock *gSurfPendLock;
@@ -1548,11 +1585,27 @@ static void nvSurfMark(unsigned int id, bool pending)
         if (gSurfPend[i].seq < gSurfPend[oldest].seq) oldest = i;
     }
     if (pending) {
-        if (slot == 32) slot = oldest;   // 32 surfaces in flight at once is not a compositor; the oldest mark goes
-        gSurfPend[slot].id = id; gSurfPend[slot].seq = ++gSurfPendSeq;
+        bool evicted = false;
+        if (slot == 32) {
+            slot = oldest;   // 32 surfaces in flight at once is not a compositor; the oldest mark goes
+            evicted = gSurfPend[slot].id != 0;
+        }
+        if (gSurfPend[slot].id == id) {
+            if (gSurfPend[slot].refs < ~0u) gSurfPend[slot].refs++;
+        } else {
+            gSurfPend[slot].id = id;
+            gSurfPend[slot].refs = 1;
+            if (evicted) IOLockWakeup(l, gSurfPend, false);
+        }
+        gSurfPend[slot].seq = ++gSurfPendSeq;
     } else if (slot < 32 && gSurfPend[slot].id == id) {
-        gSurfPend[slot].id = 0;
-        IOLockWakeup(l, gSurfPend, false);
+        if (gSurfPend[slot].refs > 1) {
+            gSurfPend[slot].refs--;
+        } else {
+            gSurfPend[slot].id = 0;
+            gSurfPend[slot].refs = 0;
+            IOLockWakeup(l, gSurfPend, false);
+        }
     }
     IOLockUnlock(l);
     OSAddAtomic64(1, &gCntSurfMarks);
@@ -1567,9 +1620,9 @@ static bool nvSurfWaitReady(unsigned int id)
     IOLockLock(l);
     for (;;) {
         unsigned i = 0;
-        while (i < 32 && gSurfPend[i].id != id) i++;
+        while (i < 32 && (gSurfPend[i].id != id || gSurfPend[i].refs == 0)) i++;
         if (i == 32) break;
-        if (mach_absolute_time() >= deadline) { gSurfPend[i].id = 0; ready = false; break; }
+        if (mach_absolute_time() >= deadline) { gSurfPend[i].id = 0; gSurfPend[i].refs = 0; ready = false; break; }
         waited = true;
         IOLockSleepDeadline(l, gSurfPend, deadline, THREAD_UNINT);
     }
@@ -2072,15 +2125,43 @@ struct NVIopFlipCache { IOSurface *s; NVResource *res; NVVidMemory *vm; void *km
 static NVIopFlipCache gIopFlipCache[8];
 static IOSimpleLock *gIopFlipCacheLock;
 static unsigned long long gIopFlipCacheTick;
+static void nvAccelIopCacheForget(const NVResource *res, const NVVidMemory *vm, const void *skipRelease)
+{
+    if (!gIopFlipCacheLock || (!res && !vm)) return;
+    NVIopFlipCache dropped[8];
+    unsigned ndrop = 0;
+    IOSimpleLockLock(gIopFlipCacheLock);
+    for (unsigned i = 0; i < 8; i++) {
+        if (!gIopFlipCache[i].s) continue;
+        if ((res && gIopFlipCache[i].res == res) || (vm && gIopFlipCache[i].vm == vm)) {
+            dropped[ndrop++] = gIopFlipCache[i];
+            gIopFlipCache[i].s = nullptr;
+            gIopFlipCache[i].res = nullptr;
+            gIopFlipCache[i].vm = nullptr;
+            gIopFlipCache[i].kmem = nullptr;
+            gIopFlipCache[i].bytes = 0;
+            gIopFlipCache[i].use = 0;
+        }
+    }
+    IOSimpleLockUnlock(gIopFlipCacheLock);
+    for (unsigned i = 0; i < ndrop; i++) {
+        if (dropped[i].vm && dropped[i].vm != skipRelease) ((OSObject *)dropped[i].vm)->release();
+        if (dropped[i].res && dropped[i].res != skipRelease) ((OSObject *)dropped[i].res)->release();
+        if (dropped[i].s) ((OSObject *)dropped[i].s)->release();
+    }
+}
 static bool nvAccelIopCacheGet(IOSurface *s, NVResource **res, NVVidMemory **vm, void **kmem, unsigned long long *bytes)
 {
     if (!gIopFlipCacheLock) return false;
     bool hit = false;
     IOSimpleLockLock(gIopFlipCacheLock);
     for (unsigned i = 0; i < 8; i++) if (gIopFlipCache[i].s == s) {
+        NVResource *r = gIopFlipCache[i].res;
         NVVidMemory *v = gIopFlipCache[i].vm;
-        if (v && v->fRmHandle == gIopFlipCache[i].kmem && v->fBytes == gIopFlipCache[i].bytes) {
-            *res = gIopFlipCache[i].res; *vm = v; *kmem = gIopFlipCache[i].kmem; *bytes = gIopFlipCache[i].bytes;
+        if (r && v && v->fRmHandle == gIopFlipCache[i].kmem && v->fBytes == gIopFlipCache[i].bytes && !v->fScanout) {
+            ((OSObject *)r)->retain();
+            ((OSObject *)v)->retain();
+            *res = r; *vm = v; *kmem = gIopFlipCache[i].kmem; *bytes = gIopFlipCache[i].bytes;
             gIopFlipCache[i].use = ++gIopFlipCacheTick; hit = true;
         }
         break;
@@ -2090,10 +2171,12 @@ static bool nvAccelIopCacheGet(IOSurface *s, NVResource **res, NVVidMemory **vm,
 }
 static void nvAccelIopCachePut(IOSurface *s, NVResource *res, NVVidMemory *vm, void *kmem, unsigned long long bytes)
 {
+    if (!s || !res || !vm || !kmem) return;
     if (!gIopFlipCacheLock) { IOSimpleLock *l = IOSimpleLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gIopFlipCacheLock)) IOSimpleLockFree(l); }
     if (!gIopFlipCacheLock) return;
-    IOSurface *drop = nullptr;
     ((OSObject *)s)->retain();
+    ((OSObject *)res)->retain();
+    ((OSObject *)vm)->retain();
     IOSimpleLockLock(gIopFlipCacheLock);
     unsigned k = 0;
     for (unsigned i = 0; i < 8; i++) {
@@ -2101,12 +2184,20 @@ static void nvAccelIopCachePut(IOSurface *s, NVResource *res, NVVidMemory *vm, v
         if (!gIopFlipCache[i].s) { k = i; break; }
         if (gIopFlipCache[i].use < gIopFlipCache[k].use) k = i;
     }
-    drop = gIopFlipCache[k].s;
+    IOSurface *dropS = gIopFlipCache[k].s;
+    NVResource *dropRes = gIopFlipCache[k].res;
+    NVVidMemory *dropVm = gIopFlipCache[k].vm;
     gIopFlipCache[k].s = s; gIopFlipCache[k].res = res; gIopFlipCache[k].vm = vm; gIopFlipCache[k].kmem = kmem;
     gIopFlipCache[k].bytes = bytes; gIopFlipCache[k].use = ++gIopFlipCacheTick;
     IOSimpleLockUnlock(gIopFlipCacheLock);
-    if (drop) ((OSObject *)drop)->release();
+    if (dropVm) ((OSObject *)dropVm)->release();
+    if (dropRes) ((OSObject *)dropRes)->release();
+    if (dropS) ((OSObject *)dropS)->release();
 }
+template <typename T> struct NVScopedRetain {
+    T *ptr = nullptr;
+    ~NVScopedRetain() { if (ptr) ((OSObject *)ptr)->release(); }
+};
 extern "C" {
 void _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(void *pipe, void *arg);
 struct thread_call *thread_call_allocate(void (*func)(void *, void *), void *param0);
@@ -2245,8 +2336,10 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
     NVAccel *a = NVAccel::gAccel;
     if (!a) return nvAccelIopFlipNo(1);
     if (s->getPixelFormat() != 0x42475241u) return nvAccelIopFlipNo(2);
+    NVScopedRetain<NVResource> resHold; NVScopedRetain<NVVidMemory> vmHold;
     NVResource *res = nullptr; NVVidMemory *vm = nullptr; void *kmem = nullptr; unsigned long long bytes = 0;
     if (nvAccelIopCacheGet(s, &res, &vm, &kmem, &bytes)) {
+        resHold.ptr = res; vmHold.ptr = vm;
         OSAddAtomic64(1, &gCntIopFlipHit);
     } else {
         if (!nvFamLock(a, true)) return nvAccelIopFlipNo(3);
@@ -2256,6 +2349,9 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
         vm = res ? nvres_vidmem(res) : nullptr;
         kmem = (vm && vm->fRmHandle && vm->fBytes && !vm->fScanout) ? vm->fRmHandle : nullptr;
         bytes = vm ? vm->fBytes : 0;
+        if (res) ((OSObject *)res)->retain();
+        if (vm) ((OSObject *)vm)->retain();
+        resHold.ptr = res; vmHold.ptr = vm;
         if (cache) ((OSObject *)cache)->release();
         nvFamUnlock(a);
         OSAddAtomic64(1, &gCntIopFlipMiss);

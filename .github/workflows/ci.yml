@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "feat/**" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   build-and-test:
@@ -28,7 +29,7 @@ jobs:
       shell: bash
       run: |
         set +e
-        make test CXX=clang++ 2>&1 | tee test.log
+        (make test CXX=clang++ && python3 tests/test_phx_profile.py) 2>&1 | tee test.log
         status=${PIPESTATUS[0]}
         if [ "$status" -ne 0 ]; then
           # Surface the failing output as an annotation on the PR.
