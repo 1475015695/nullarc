@@ -185,7 +185,6 @@ struct IOAccelPhxNativeClient {
     IOReturn doSubmit(IOExternalMethodArguments *a);
     IOReturn doWaitSeq(IOExternalMethodArguments *a);
 };
-constexpr uint32_t PHXN_PLACED_HI_POOL = 1;
 '''
         for s in (
             'IOReturn PhxBringup::vmMap(',
@@ -331,9 +330,9 @@ int main() {
         self.assertIn('nvmtl_pipe_cache_init();', vk_c)
         self.assertIn('nvmtl_fence_acquire(&fence)', vk_c)
         self.assertIn('nvmtl_fence_release(fence, 1)', vk_c)
-        for fn in ('nvmtl_vk_cmd_fill_buffer(', 'nvmtl_vk_cmd_write_word(',
-                   'nvmtl_vk_cmd_copy_buffer(', 'nvmtl_vk_cmd_copy_buffer_to_image_level_layer(',
-                   'nvmtl_vk_cmd_copy_image_to_buffer_level_layer('):
+        for fn in ('int nvmtl_vk_cmd_fill_buffer(', 'int nvmtl_vk_cmd_write_word(',
+                   'int nvmtl_vk_cmd_copy_buffer(', 'int nvmtl_vk_cmd_copy_buffer_to_image_level_layer(',
+                   'int nvmtl_vk_cmd_copy_image_to_buffer_level_layer('):
             body = method(vk_c, fn)
             self.assertIn('nvmtl_vk_cmd_barrier_to_transfer(', body, fn)
             self.assertIn('nvmtl_vk_cmd_barrier_from_transfer(', body, fn)
