@@ -194,7 +194,7 @@ void flushLine(void *) { flushed++; }
 constexpr uint32_t kPtMaxPages=1, kPtPageBytes=4096, kFirstUserVmid=8;
 struct Buffer { uint8_t bytes[4096]; uint64_t *kva() { return reinterpret_cast<uint64_t *>(bytes); } };
 struct PhxBringup {
-    struct VmCtx { uint64_t *chunkKva[1]{}; uint32_t used=1, hw=8; bool busy=true; } vm[1];
+    struct VmCtx { uint64_t **chunkKva=nullptr; uint32_t used=1, hw=8; bool busy=true; } vm[1];
     struct Hw { uint32_t ctx=1; } hwv[1];
     Lock mutex; Lock *gpuLock=&mutex;
     uint64_t retired=0;
@@ -213,7 +213,8 @@ struct PhxBringup {
         code += r'''
 int main() {
     Buffer buffer; std::memset(buffer.bytes, 0xab, sizeof(buffer.bytes));
-    PhxBringup owner; owner.vm[0].chunkKva[0]=buffer.kva();
+    uint64_t *kvaSlots[1]{buffer.kva()};
+    PhxBringup owner; owner.vm[0].chunkKva=kvaSlots;
     assert(!owner.vmidFree(1, 7));
     assert(owner.vm[0].busy && owner.vm[0].hw==8 && owner.hwv[0].ctx==1);
     assert(buffer.bytes[0]==0xab && !owner.tlb && !flushed);

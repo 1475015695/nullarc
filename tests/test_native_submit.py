@@ -143,7 +143,7 @@ int main() {
     PhxBringup oom;client.owner=&oom;failAllocation=true;gTrackedGpuLock=oom.gpuLock;
     assert(client.doSubmit(&args)==kIOReturnNoMemory && !oom.registerWrites && !allocations);
     failAllocation=false;
-    PhxBringup success;success.flushOk=true;client.owner=&success;
+    PhxBringup success;success.flushOk=true;gTrackedGpuLock=success.gpuLock;client.owner=&success;
     assert(client.doSubmit(&args)==0 && success.gSeq==1 && success.packetWrites);
     assert(client.emitted==1 && client.lastSeq==1 && args.scalarOutput[0]==1);
     assert(allocations==1 && md.refs==2 && client.pendingFences.head);

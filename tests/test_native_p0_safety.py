@@ -46,7 +46,6 @@ static void nanoseconds_to_absolutetime(uint64_t ns, uint64_t *out) { *out = ns;
 static uint64_t gNow = 10000000000ull;
 static uint64_t mach_absolute_time() { return gNow; }
 static int gHangMs = 3000;
-static unsigned gKills = 0;
 static int kernel_task = 0;
 
 static unsigned gHeapAllocs = 0;
@@ -105,6 +104,11 @@ struct OSSymbol {
 };
 unsigned OSSymbol::symAllocs = 0;
 unsigned OSSymbol::symFrees = 0;
+
+struct PhxSurfShareEsc {
+    uint32_t version, surfaceID, plane, hClient, hSrcClient, hSrcMemory, status, pad;
+    uint64_t size;
+};
 
 struct AccelService {
     unsigned refs{1};
@@ -173,7 +177,7 @@ struct PhxBringup {
     struct HwVmid { uint32_t ctx; uint64_t lastSeq, lastUse, binding; } hwv[8]{};
     using GpuQueue = PhxGpuQueue;
     GpuQueue gq[2]{};
-    struct Aper { uint8_t mem[4096]{}; uintptr_t getVirtualAddress() { return reinterpret_cast<uintptr_t>(mem); } } aper;
+    struct Aper { alignas(8) uint8_t mem[4096]{}; uintptr_t getVirtualAddress() { return reinterpret_cast<uintptr_t>(mem); } } aper;
     Aper *fbAper = &aper;
     bool mmioBuf{true};
     bool *mmio = &mmioBuf;
@@ -369,8 +373,10 @@ int main() {
 
         # Source invariants for P0 fixes
         self.assertNotIn('ml_io_map', source)
+        self.assertEqual(source.count('static bool phxFirebatEcAllowed()'), 1)
         self.assertIn('phxFirebatEcAllowed()', source)
         self.assertIn('IODeviceMemory::withRange((IOPhysicalAddress)0xFE0B0400ull', source)
+        self.assertLess(source.index('gCntIopCopySkip'), source.index('OSAddAtomic64(1, &gCntIopCopySkip);'))
         self.assertIn('if (!nvSurfWaitReady(s->getSurfaceID()))', source)
         self.assertIn('nvAccelIopCacheForget(this, nullptr, this);', source)
         self.assertIn('nvAccelIopCacheForget(nullptr, this, nullptr);', source)
@@ -554,15 +560,22 @@ int main() {
 #include <string>
 
 static std::vector<std::string> gLog;
+using SInt64 = int64_t;
 using thread_call_param_t = void *;
 using thread_call_t = void *;
 using IOFBInterruptProc = void (*)(void *, void *);
 struct IOService {};
 struct IOFramebuffer { static void stop(IOService *) { gLog.push_back("super::stop"); } };
+struct Res {
+    const char *tag;
+    void terminate() { gLog.push_back(std::string("term:") + tag); }
+    void release() { gLog.push_back(std::string("rel:") + tag); }
+};
+#define OSSafeReleaseNULL(x) do { if (x) { (x)->release(); (x) = nullptr; } } while (0)
 static bool gVblStaged = false;
 static uint64_t gPhxVblLastAbs = 0, gPhxVblSeq = 0;
 static int64_t gVblLateUsSum = 0, gVblLateUsMax = 0, gVblN = 0;
-static void *gPhxHDMI = nullptr;
+static Res *gPhxHDMI = nullptr;
 static void *gPhxPrimaryFB = nullptr;
 static uint64_t gPhxFrameAbs = 0;
 static bool gAliasSysctl = false;
@@ -579,12 +592,6 @@ static void thread_call_enter_delayed(void *, uint64_t) { gRearms++; }
 static void thread_call_cancel(void *) { gLog.push_back("vbl_cancel"); }
 static bool thread_call_free(void *) { gLog.push_back("vbl_free"); return true; }
 
-struct Res {
-    const char *tag;
-    void terminate() { gLog.push_back(std::string("term:") + tag); }
-    void release() { gLog.push_back(std::string("rel:") + tag); }
-};
-#define OSSafeReleaseNULL(x) do { if (x) { (x)->release(); (x) = nullptr; } } while (0)
 struct WorkLoop { void removeEventSource(Res *) { gLog.push_back("rm_wake"); } } gWl;
 using IOWorkLoop = WorkLoop;
 

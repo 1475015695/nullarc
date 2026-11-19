@@ -1033,7 +1033,7 @@ public:
 };
 
 static int    gNvIop = 0;
-static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
+static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank, gCntIopCopySkip;
 static SInt64 gCntIopOkHead[kNvMaxFB];
 #define NVIOP_LOG_MAX 40
 static unsigned gIopLogs = 0;
@@ -1377,12 +1377,6 @@ SYSCTL_PROC(_debug, OID_AUTO, nvaccelfb, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCK
             NULL, 0, nvaccelfb_sysctl, "I",
             "register the NVIDIA framebuffer with the accelerator display machine (1 = found_framebuffer, 2 = family sweep)");
 
-static bool phxFirebatEcAllowed()
-{
-    int allow = 0;
-    return PE_parse_boot_argn("phxfirebat_ec", &allow, sizeof(allow)) && allow == 1;
-}
-
 static int gFirebatFanMode = 2; // Default to Quiet (2)
 
 void NVAccel::fanWorker(void *p0, void *p1)
@@ -1505,7 +1499,6 @@ NVACCEL_CNT(nvaccel_iop_empty,        gCntIopEmpty,       "K3: transactions with
 NVACCEL_CNT(nvaccel_iop_src_res,      gCntIopSrcRes,      "K3: frames sourced from our VRAM resource");
 NVACCEL_CNT(nvaccel_iop_src_surf,     gCntIopSrcSurf,     "K3: frames sourced from the IOSurface memory");
 NVACCEL_CNT(nvaccel_iop_blank,        gCntIopBlank,       "K6: frames copied whose 64 samples were all ONE colour (a blank frame)");
-static SInt64 gCntIopCopySkip;
 NVACCEL_CNT(nvaccel_iop_copy_skip,    gCntIopCopySkip,    "frames kept on the panel because the surface's newest pixels were not yet in system memory");
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_bench, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopBench, 0, "1 = time a read-only pass over the next copied frame's source (nvaccel_iop_read_us)");
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_sse, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopSse, 0, "1 = copy frames with SSE4.1 streaming loads (fast from write-combined surfaces), 0 = 8-byte loads (default until proven)");
