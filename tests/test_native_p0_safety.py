@@ -38,7 +38,7 @@ struct Lock { bool held = false; };
 static Lock *gTrackedLock = nullptr;
 static void IOLockLock(Lock *l) { assert(!l->held); l->held = true; }
 static void IOLockUnlock(Lock *l) { assert(l->held); l->held = false; }
-static void bzero(void *p, size_t n) { std::memset(p, 0, n); }
+void bzero(void *p, size_t n) { std::memset(p, 0, n); }
 static unsigned gFlushes = 0;
 static void flushLine(const volatile void *) { gFlushes++; }
 template<class... T> static void IOLog(const char *, T...) {}
@@ -78,7 +78,8 @@ struct IOBufferMemoryDescriptor {
     void release() { assert(refs); if (--refs == 0) { gPageFrees++; delete this; } }
 };
 
-struct FakeMd {
+class IOMemoryDescriptor {
+public:
     uint64_t len{8192};
     uint64_t getLength() const { return len; }
     addr64_t getPhysicalSegment(uint64_t off, IOByteCount *segLen, int) const {
@@ -86,7 +87,6 @@ struct FakeMd {
         return 0x40000000ull + off;
     }
 };
-using IOMemoryDescriptor = FakeMd;
 
 struct OSSymbol {
     const char *name;
@@ -313,7 +313,7 @@ int main() {
     assert(!owner.isGpuSleeping());
 
     // Map 8 KiB on context 2 and test hangCheck fires after wake, then unmap + free.
-    FakeMd md;
+    IOMemoryDescriptor md;
     uint32_t ctx2 = owner.vmidAlloc();
     assert(ctx2 == 2);
     assert(owner.vmMap(ctx2, 0x100000000ull, &md, 0, 8192) == kIOReturnSuccess);
