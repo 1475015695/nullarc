@@ -11,8 +11,11 @@
 - **上游基线**：`luuumi-dev/nullarc`（`main @ 3497d87`）
 - **当前分支**：`1475015695/nullarc` → `feat/um790pro`
 - **提交历史（按时间倒序）**：
+  - `f206737` — `test(um790pro): drop duplicate PHXN_PLACED_HI_POOL and disambiguate nvmtl_vk_cmd signatures`（P1 宿主机 CI 全绿验证，Run [`44475519597`](https://github.com/1475015695/nullarc/actions/runs/44475519597)）
+  - `a6fb16f` — `test(um790pro): fix Clang -Werror and C11 harness issues in P1 host tests`
+  - `5f2ef85` — `docs(um790pro): add AI_SYNC_LOG handoff record and update P0/P1 progress`
   - `a209038` — `feat(um790pro): P1 CPU load reduction and GPU pipeline optimizations`（P1 全量核心优化与 `test_phx_va_maps.cpp` / `test_native_p1_perf.py` 单测）
-  - `83f6770` — `test(um790pro): fix bzero linkage and IOMemoryDescriptor stub in P0 test`（CI 全绿验证，Run [`44448991709`](https://github.com/1475015695/nullarc/actions/runs/44448991709)）
+  - `83f6770` — `test(um790pro): fix bzero linkage and IOMemoryDescriptor stub in P0 test`（P0 CI 全绿验证，Run [`44448991709`](https://github.com/1475015695/nullarc/actions/runs/44448991709)）
   - `9c5ee04` — `fix(um790pro): resolve kext duplicate helper and host test warnings`
   - `abb662b` — `feat(um790pro): P0 safety baseline and kernel stability fixes`
   - `3986a08` — `docs: add UM790 Pro safety baseline and optimization roadmap`
