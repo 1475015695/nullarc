@@ -24,7 +24,6 @@ constexpr int kIOReturnSuccess=0,kIOReturnNotReady=1,kIOReturnBusy=2,kIOReturnTi
 constexpr int kIOReturnBadArgument=4,kIOReturnNotFound=5,kIOReturnUnsupported=6;
 constexpr int kIOReturnNoResources=7,kIOReturnNoMemory=8;
 constexpr unsigned kFirstUserVmid=8,kNumUserVmids=8,kMaxCtx=64;
-constexpr int kMaxMaps=1;
 constexpr unsigned kRegCtx0BaseLo=1,kRegCtx0Cntl=100,kRegCtx0StartLo=200,kRegCtx0EndLo=300;
 constexpr uint64_t kVaMask=(1ull<<48)-1;
 struct Lock { bool held=false; };

@@ -27,7 +27,6 @@ class NativeLifetimeTest(unittest.TestCase):
 #include "phxbringup/PhxVaMaps.h"
 using IOReturn = int;
 constexpr int kIOReturnBadArgument=1, kIOReturnNotFound=2, kIOReturnBusy=3, kIOReturnSuccess=0;
-constexpr int kMaxMaps=1;
 struct IOExternalMethodArguments { uint64_t scalarInput[1]; };
 bool shape(IOExternalMethodArguments *, int, int, int, int) { return true; }
 unsigned sleeps;

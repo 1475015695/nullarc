@@ -96,6 +96,7 @@ struct PhxBringup {
     bool isGpuSleeping() const { return sleeping; }
     bool vmHealthy() const { return !fault; }
     bool gpuReady() const { return ready; }
+    bool debugEnabled() const { return false; }
     uint8_t queueIndexFor(bool gfx) const { return gfx ? (gq[1].ready ? 1u : 0u) : (gq[0].ready ? 0u : 1u); }
     void ptRefillReserve(uint32_t) { refills++; }
     VmCtx *vmCtx(uint32_t h) { return h && h <= kMaxCtx && vm[h - 1].busy ? &vm[h - 1] : nullptr; }
@@ -352,9 +353,12 @@ int main() {
         ])
 
         c_harness = r'''
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include <assert.h>
 #include <limits.h>
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -413,24 +417,30 @@ static void nvlog(const char *fmt, ...) { (void)fmt; }
 static unsigned g_fence_creates = 0, g_fence_resets = 0, g_fence_destroys = 0;
 static int g_fail_reset = 0;
 static uint64_t g_next_fence_id = 0x100;
-static VkResult mock_vkCreateFence(VkDevice, const VkFenceCreateInfo *, const VkAllocationCallbacks *, VkFence *out) {
+static VkResult mock_vkCreateFence(VkDevice dev, const VkFenceCreateInfo *ci, const VkAllocationCallbacks *alloc, VkFence *out) {
+    (void)dev; (void)ci; (void)alloc;
     g_fence_creates++;
     *out = (VkFence)(uintptr_t)(++g_next_fence_id);
     return VK_SUCCESS;
 }
-static VkResult mock_vkResetFences(VkDevice, uint32_t count, const VkFence *) {
+static VkResult mock_vkResetFences(VkDevice dev, uint32_t count, const VkFence *fences) {
+    (void)dev; (void)fences;
     assert(count == 1);
     if (g_fail_reset) return VK_ERROR_INITIALIZATION_FAILED;
     g_fence_resets++;
     return VK_SUCCESS;
 }
-static void mock_vkDestroyFence(VkDevice, VkFence, const VkAllocationCallbacks *) { g_fence_destroys++; }
+static void mock_vkDestroyFence(VkDevice dev, VkFence fence, const VkAllocationCallbacks *alloc) {
+    (void)dev; (void)fence; (void)alloc;
+    g_fence_destroys++;
+}
 static VkResult (*pvkCreateFence)(VkDevice, const VkFenceCreateInfo *, const VkAllocationCallbacks *, VkFence *) = mock_vkCreateFence;
 static VkResult (*pvkResetFences)(VkDevice, uint32_t, const VkFence *) = mock_vkResetFences;
 static void (*pvkDestroyFence)(VkDevice, VkFence, const VkAllocationCallbacks *) = mock_vkDestroyFence;
 
 static unsigned g_bda_calls = 0;
-static uint64_t mock_vkGetBufferDeviceAddress(VkDevice, const VkBufferDeviceAddressInfo *info) {
+static uint64_t mock_vkGetBufferDeviceAddress(VkDevice dev, const VkBufferDeviceAddressInfo *info) {
+    (void)dev;
     g_bda_calls++;
     return 0xbeef0000ull + (uint64_t)(uintptr_t)info->buffer;
 }
@@ -438,8 +448,9 @@ static uint64_t (*pvkGetBufferDeviceAddress)(VkDevice, const VkBufferDeviceAddre
 
 static VkPipelineStageFlags g_last_src_stage = 0, g_last_dst_stage = 0;
 static VkMemoryBarrier g_last_mb = {0};
-static void mock_vkCmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags s, VkPipelineStageFlags d, VkFlags,
-                                      uint32_t nmb, const VkMemoryBarrier *mb, uint32_t, const void *, uint32_t, const void *) {
+static void mock_vkCmdPipelineBarrier(VkCommandBuffer cb, VkPipelineStageFlags s, VkPipelineStageFlags d, VkFlags dep,
+                                      uint32_t nmb, const VkMemoryBarrier *mb, uint32_t nbm, const void *bm, uint32_t nim, const void *im) {
+    (void)cb; (void)dep; (void)nbm; (void)bm; (void)nim; (void)im;
     g_last_src_stage = s; g_last_dst_stage = d;
     if (nmb && mb) g_last_mb = *mb;
 }
@@ -449,7 +460,8 @@ static void (*pvkCmdPipelineBarrier)(VkCommandBuffer, VkPipelineStageFlags, VkPi
 static size_t g_loaded_pcache_bytes = 0;
 static uint8_t g_loaded_pcache_sample[64] = {0};
 static uint8_t g_pcache_blob[8] = {'P', 'H', 'X', 'C', 1, 2, 3, 4};
-static VkResult mock_vkCreatePipelineCache(VkDevice, const VkPipelineCacheCreateInfo *ci, const VkAllocationCallbacks *, VkPipelineCache *out) {
+static VkResult mock_vkCreatePipelineCache(VkDevice dev, const VkPipelineCacheCreateInfo *ci, const VkAllocationCallbacks *alloc, VkPipelineCache *out) {
+    (void)dev; (void)alloc;
     g_loaded_pcache_bytes = ci->initialDataSize;
     if (ci->pInitialData && ci->initialDataSize) {
         size_t cp = ci->initialDataSize < sizeof(g_loaded_pcache_sample) ? ci->initialDataSize : sizeof(g_loaded_pcache_sample);
@@ -458,8 +470,11 @@ static VkResult mock_vkCreatePipelineCache(VkDevice, const VkPipelineCacheCreate
     *out = (VkPipelineCache)0x5555;
     return VK_SUCCESS;
 }
-static void mock_vkDestroyPipelineCache(VkDevice, VkPipelineCache, const VkAllocationCallbacks *) {}
-static VkResult mock_vkGetPipelineCacheData(VkDevice, VkPipelineCache, size_t *sz, void *data) {
+static void mock_vkDestroyPipelineCache(VkDevice dev, VkPipelineCache pc, const VkAllocationCallbacks *alloc) {
+    (void)dev; (void)pc; (void)alloc;
+}
+static VkResult mock_vkGetPipelineCacheData(VkDevice dev, VkPipelineCache pc, size_t *sz, void *data) {
+    (void)dev; (void)pc;
     *sz = sizeof(g_pcache_blob);
     if (data) memcpy(data, g_pcache_blob, sizeof(g_pcache_blob));
     return VK_SUCCESS;
@@ -565,7 +580,7 @@ int main(void) {
             path = pathlib.Path(tmp)
             (path / 'test_p1_vk.c').write_text(c_harness)
             subprocess.run(['clang', '-std=c11', '-Wall', '-Wextra', '-Werror',
-                            '-fsanitize=address,undefined',
+                            '-pthread', '-fsanitize=address,undefined',
                             str(path / 'test_p1_vk.c'), '-o', str(path / 'test_p1_vk')],
                            check=True)
             subprocess.run([str(path / 'test_p1_vk')], check=True)
